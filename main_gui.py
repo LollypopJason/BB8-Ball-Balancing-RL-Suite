@@ -2228,7 +2228,17 @@ def main(argv=None):
             win.close()
             app.quit()
         QTimer.singleShot(int(args.screenshot_delay * 1000), snap)
-    return app.exec()
+    ret = app.exec()
+    shutdown_qt(app, win)
+    return ret
+
+
+def shutdown_qt(app, win) -> None:
+    """Destroy widgets while the interpreter is alive (avoids pyqtgraph/PySide atexit teardown errors)."""
+    win.deleteLater()
+    app.processEvents()
+    app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    app.processEvents()
 
 
 if __name__ == "__main__":

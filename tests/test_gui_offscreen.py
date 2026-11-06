@@ -193,6 +193,7 @@ def main():
     pump(app, 0.5)
     win.grab().save(os.path.join(TMP, "final.png"))
     win.close()
+    G.shutdown_qt(app, win)
     print("GUI exercise OK ->", TMP)
 
 

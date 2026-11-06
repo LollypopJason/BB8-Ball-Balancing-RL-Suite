@@ -299,7 +299,7 @@ class RewardWeights:
     action: float = 0.01
     action_rate: float = 0.05
     drift: float = 0.5
-    ball_velocity: float = 0.5              # penalise |v_ball|^2 (prevents run-away drift to wheel-speed saturation)
+    ball_velocity: float = 1.0              # penalise |v_ball|^2 (prevents run-away drift to wheel-speed saturation)
     target_distance: float = 0.5
     target_progress: float = 5.0
     target_reached_bonus: float = 2.0
@@ -344,11 +344,11 @@ class TrainingConfig:
     n_steps: int = 1024                     # PPO rollout per env
     batch_size: int = 256
     n_epochs: int = 10
-    gamma: float = 0.99
+    gamma: float = 0.995
     gae_lambda: float = 0.95
     ent_coef: float = 0.0
     clip_range: float = 0.2
-    log_std_init: float = -0.5
+    log_std_init: float = -1.0
     sac_buffer_size: int = 500_000
     autosave_every_steps: int = 100_000
     autosave_every_minutes: float = 5.0

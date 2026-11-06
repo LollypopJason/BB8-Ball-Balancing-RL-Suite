@@ -8,6 +8,8 @@ live in the head that balances on top of the ball), and **deploying** them on an
 No web server, no browser, no TensorBoard: everything (3D viewport, plots, editors, exporters) is a
 native Qt widget.
 
+![Parallel grid mode](docs/screenshot_grid.png)
+
 ---
 
 ## Contents
@@ -517,7 +519,12 @@ mode and ESC factory reset.
 * **Dents** act through the convex hull (flat spots), not as concave pockets.
 * **Odometry** (target observation on hardware) assumes no slip; while wheels slip it over-estimates
   distance — retrain with targets disabled for pure balancing if you do not need waypoints.
-* **Training budget**: on a 4-core laptop CPU PPO reaches several seconds of balancing within ~0.5 M steps;
-  robust balancing under full randomisation needs several million steps — use Headless Turbo and all cores.
+* **Training status (measured, not yet solved)**: with the default randomisation on a 4-core CPU
+  (~1.4 k steps/s), PPO goes from ~0.6 s to ~7–8 s mean survival (episode limit 20 s) within 0.5–1.2 M steps
+  and then plateaus. The dominant failure mode is a slow drift that builds up until the wheels saturate at
+  `stepper_max_speed_rads` (~1.7 m/s ball speed), after which the head falls. Expect to need longer runs
+  (several million steps, Headless Turbo, all cores) and reward/curriculum tuning (e.g. start with
+  *Off (Ideal Nominal Physics)*, raise `ball_velocity`/`drift` weights) to get a policy fit for hardware.
+  A hand-tuned PD velocity controller balances the same model indefinitely, so the plant is controllable.
 * Policies are geometry-specific: retrain (or fine-tune from the session) after changing zenith angle,
   wheel size or ball radius.

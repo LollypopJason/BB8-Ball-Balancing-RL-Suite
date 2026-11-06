@@ -1,0 +1,15 @@
+# BB-8 RL Suite & Deployment Studio - desktop / training workstation
+# Python 3.10 - 3.13. Tested with the versions noted on the right.
+mujoco>=3.2            # 3.17.0
+gymnasium>=1.0         # 1.4.0
+numpy>=1.26            # 2.5.3
+torch>=2.2             # 2.15.0  (CPU wheel is enough; CUDA optional)
+stable-baselines3>=2.3 # 2.9.2
+onnx>=1.15             # 1.23.2
+onnxruntime>=1.17      # 1.29.0
+PySide6>=6.6           # 6.12.0
+pyqtgraph>=0.13.7      # 0.14.0
+psutil>=5.9            # 7.2.2
+
+# Jetson Nano runtime (install ON the Jetson, see README section 9):
+#   numpy smbus2 pyserial onnxruntime(-gpu JetPack wheel) onnx

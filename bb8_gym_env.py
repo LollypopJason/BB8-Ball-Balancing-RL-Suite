@@ -152,6 +152,7 @@ class BB8BalanceEnv(gym.Env):
         self.s_quat = m.sensor_adr[sid("imu_quat")]
         self.s_gyro = m.sensor_adr[sid("imu_gyro")]
         self.s_acc = m.sensor_adr[sid("imu_accel")]
+        self.ball_dadr = m.jnt_dofadr[nid(mujoco.mjtObj.mjOBJ_JOINT, "ball_free")]
         if self.roller_mode:
             self.ball_jadr = m.jnt_qposadr[nid(mujoco.mjtObj.mjOBJ_JOINT, "ball_free")]
             self.head_jadr = m.jnt_qposadr[nid(mujoco.mjtObj.mjOBJ_JOINT, "head_free")]
@@ -612,6 +613,8 @@ class BB8BalanceEnv(gym.Env):
             "action_rate": -w.action_rate * float((a - self.prev_action) @ (a - self.prev_action)),
         }
         pos = self.ball_pos()[:2]
+        v = self.data.qvel[self.ball_dadr:self.ball_dadr + 2]
+        t["ball_velocity"] = -w.ball_velocity * float(v @ v) * (0.2 if self.target_enabled else 1.0)
         if self.target_enabled:
             dist = self._target_dist()
             t["target_distance"] = -w.target_distance * min(dist, 3.0)

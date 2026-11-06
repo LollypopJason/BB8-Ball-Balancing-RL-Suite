@@ -298,7 +298,8 @@ class RewardWeights:
     ang_vel: float = 0.02
     action: float = 0.01
     action_rate: float = 0.05
-    drift: float = 0.2
+    drift: float = 0.5
+    ball_velocity: float = 0.5              # penalise |v_ball|^2 (prevents run-away drift to wheel-speed saturation)
     target_distance: float = 0.5
     target_progress: float = 5.0
     target_reached_bonus: float = 2.0

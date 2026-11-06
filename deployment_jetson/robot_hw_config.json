@@ -1,0 +1,40 @@
+{
+  "_comment": "Flat JSON shared by jetson_control_loop.py and jetson_control_loop.cpp. Geometry MUST match the simulator config used for training.",
+  "control_hz": 100.0,
+  "ball_radius_m": 0.125,
+  "wheel_radius_m": 0.029,
+  "zenith_angle_deg": 31.0,
+  "wheel_azimuths_deg": [0.0, 120.0, 240.0],
+  "max_wheel_speed_rads": 45.0,
+  "full_steps_per_rev": 200,
+  "microsteps": 16,
+  "motor_direction_sign": [1, 1, 1],
+  "encoder_direction_sign": [1, 1, 1],
+  "encoder_velocity_lpf_alpha": 0.5,
+  "deadband_rads": 0.0,
+  "tilt_cutoff_deg": 35.0,
+  "target_enabled": false,
+  "target_x_m": 0.0,
+  "target_y_m": 0.0,
+
+  "i2c_bus": 1,
+  "imu_i2c_addr": 66,
+  "encoder_mux_addr": 112,
+  "encoder_mux_channels": [0, 1, 2],
+  "encoder_i2c_addr": 54,
+
+  "motor_driver_mode": "uart",
+  "tmc_uart_ports": ["/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2"],
+  "tmc_uart_baud": 115200,
+  "tmc_fclk_hz": 12000000.0,
+  "tmc_irun": 20,
+  "tmc_ihold": 10,
+
+  "gpio_chip": "gpiochip0",
+  "step_lines": [149, 38, 12],
+  "dir_lines": [200, 76, 77],
+  "enable_line": 78,
+
+  "policy_onnx": "best_policy.onnx",
+  "log_csv": "jetson_run_log.csv"
+}

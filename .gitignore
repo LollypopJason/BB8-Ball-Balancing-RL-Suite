@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+workspace/
+*.egg-info/
+.venv/
+venv/
+build/
+deployment_jetson/build/
+bb8_default.xml

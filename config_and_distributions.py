@@ -164,9 +164,9 @@ def _n(m, s, units="", lo=-1e9, hi=1e9):
 class RobotGeometryConfig:
     """Nominal (structural) robot geometry and actuator datasheet values."""
 
-    ball_radius_m: float = 0.125
+    ball_radius_m: float = 0.25             # 50 cm diameter ball
     ball_mesh_subdivisions: int = 3          # icosphere level (3 -> 642 verts)
-    ball_inertia_factor: float = 0.60        # I = k*m*R^2 (0.4 solid, 0.667 thin shell)
+    ball_inertia_factor: float = 0.62        # I = k*m*R^2 (0.4 solid, 0.667 thin shell)
     zenith_angle_deg: float = DEFAULT_ZENITH_DEG   # contact angle from top pole (31 -> 40)
     wheel_azimuths_deg: List[float] = field(default_factory=lambda: list(DEFAULT_WHEEL_AZIMUTHS_DEG))
     wheel_diameter_m: float = DEFAULT_WHEEL_DIAMETER_M
@@ -174,7 +174,7 @@ class RobotGeometryConfig:
     rollers_per_row: int = 6                 # multi-roller approximation (2 staggered rows)
     omniwheel_model: str = "virtual"         # "virtual" (Jacobian transmission) | "roller" (contact rollers)
     head_mass_kg: float = 2.2
-    head_radius_m: float = 0.115             # visual dome radius
+    head_radius_m: float = 0.15              # head dome radius (30 cm head, BB-8 proportions)
     head_cog_height_m: float = 0.085         # CoG height above the top of the ball
     imu_height_m: float = 0.06               # IMU site height above top of the ball
     stepper_holding_torque_nm: float = STEPPER_HOLDING_TORQUE_NM
@@ -203,7 +203,7 @@ class RobotGeometryConfig:
 
 @dataclass
 class BallRandomization:
-    mass_kg: DP = _u(0.70, 0.95, "kg", 0.05, 10)
+    mass_kg: DP = _u(2.0, 3.0, "kg", 0.05, 20)     # 50 cm hollow styrofoam + epoxy/sawdust shell (estimate - weigh yours)
     sliding_grip: DP = _u(0.7, 1.1, "mu", 0.05, 3)
     torsional_friction: DP = _u(0.002, 0.01, "m", 0.0, 0.1)
     rolling_resistance: DP = _u(0.0005, 0.004, "m", 0.0, 0.05)

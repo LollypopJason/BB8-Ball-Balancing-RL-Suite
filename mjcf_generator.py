@@ -177,9 +177,58 @@ def dome_mesh(radius: float, height: float, segments: int = 24, rings: int = 8) 
     return np.array(verts), np.array(faces)
 
 
-def _mesh_asset(name: str, verts: np.ndarray, faces: np.ndarray) -> str:
+def sphere_patch_mesh(radius: float, a0: float, a1: float, az0: float = 0.0, az1: float = 2 * math.pi,
+                      segs: int = 48, rows: int = 3) -> Tuple[np.ndarray, np.ndarray]:
+    """Curved decal on a sphere around +z: polar angles [a0, a1], azimuth [az0, az1].
+    a0 = 0 gives a cap (disc). Outward-facing triangles only (visual geometry)."""
+    full = abs((az1 - az0) - 2 * math.pi) < 1e-9
+    n_az = segs if full else max(2, int(segs * (az1 - az0) / (2 * math.pi)) + 1)
+    verts, faces = [], []
+    cap = a0 <= 1e-9
+    if cap:
+        verts.append((0.0, 0.0, radius))
+    row_start = []
+    for r in range(1 if cap else 0, rows + 1):
+        a = a0 + (a1 - a0) * r / rows
+        row_start.append(len(verts))
+        for k in range(n_az if full else n_az + 0):
+            ph = az0 + (az1 - az0) * k / (n_az if full else n_az - 1)
+            verts.append((radius * math.sin(a) * math.cos(ph), radius * math.sin(a) * math.sin(ph), radius * math.cos(a)))
+    cols = n_az if full else n_az - 1
+    nxt = (lambda k: (k + 1) % n_az) if full else (lambda k: k + 1)
+    if cap:
+        for k in range(cols):
+            faces.append((0, row_start[0] + k, row_start[0] + nxt(k)))
+    for r0, r1 in zip(row_start[:-1], row_start[1:]):
+        for k in range(cols):
+            faces += [(r0 + k, r1 + k, r1 + nxt(k)), (r0 + k, r1 + nxt(k), r0 + nxt(k))]
+    return np.array(verts), np.array(faces)
+
+
+def dome_band_mesh(radius: float, height: float, p0: float, p1: float, az0: float = 0.0, az1: float = 2 * math.pi,
+                   grow: float = 1.012, segs: int = 64, rows: int = 2) -> Tuple[np.ndarray, np.ndarray]:
+    """Stripe on the elliptic head dome (same parametrisation as ``dome_mesh``), slightly outset."""
+    full = abs((az1 - az0) - 2 * math.pi) < 1e-9
+    n_az = segs if full else max(2, int(segs * (az1 - az0) / (2 * math.pi)) + 1)
+    verts, faces, starts = [], [], []
+    for r in range(rows + 1):
+        p = p0 + (p1 - p0) * r / rows
+        starts.append(len(verts))
+        for k in range(n_az):
+            ph = az0 + (az1 - az0) * k / (n_az if full else n_az - 1)
+            verts.append((grow * radius * math.cos(p) * math.cos(ph), grow * radius * math.cos(p) * math.sin(ph),
+                           grow * height * math.sin(p)))
+    cols = n_az if full else n_az - 1
+    nxt = (lambda k: (k + 1) % n_az) if full else (lambda k: k + 1)
+    for r0, r1 in zip(starts[:-1], starts[1:]):
+        for k in range(cols):
+            faces += [(r0 + k, r0 + nxt(k), r1 + nxt(k)), (r0 + k, r1 + nxt(k), r1 + k)]
+    return np.array(verts), np.array(faces)
+
+
+def _mesh_asset(name: str, verts: np.ndarray, faces: np.ndarray, shell: bool = False) -> str:
     return (f'<mesh name="{name}" vertex="{_v(verts.ravel(), 7)}" '
-            f'face="{" ".join(str(int(i)) for i in faces.ravel())}"/>')
+            f'face="{" ".join(str(int(i)) for i in faces.ravel())}"' + (' inertia="shell"' if shell else '') + '/>')
 
 
 # ============================================================================
@@ -291,20 +340,39 @@ def terrain_xml(tc: TerrainConfig) -> Tuple[str, str, Dict[str, object]]:
 
 def _common_assets() -> str:
     return """
-    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.32 0.38 0.48" rgb2="0.05 0.06 0.08" width="512" height="512"/>
-    <texture name="grid" type="2d" builtin="checker" rgb1="0.22 0.24 0.27" rgb2="0.17 0.19 0.22" width="512" height="512" mark="edge" markrgb="0.35 0.4 0.45"/>
-    <material name="grid_mat" texture="grid" texrepeat="12 12" texuniform="true" reflectance="0.08"/>
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.62 0.68 0.78" rgb2="0.10 0.11 0.14" width="512" height="512"/>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.30 0.32 0.35" rgb2="0.25 0.27 0.30" width="512" height="512" mark="edge" markrgb="0.42 0.46 0.50"/>
+    <material name="grid_mat" texture="grid" texrepeat="8 8" texuniform="true" reflectance="0.06" specular="0.2"/>
     <material name="ground_mat" rgba="0.36 0.33 0.29 1"/>
     <material name="wall_mat" rgba="0.45 0.47 0.52 1"/>
     <material name="obst_mat" rgba="0.62 0.42 0.25 1"/>
     <material name="ramp_mat" rgba="0.40 0.44 0.50 1"/>
-    <material name="ball_mat" rgba="0.94 0.93 0.90 1" specular="0.4" shininess="0.5"/>
-    <material name="bb8_orange" rgba="0.95 0.50 0.10 1"/>
-    <material name="head_mat" rgba="0.93 0.92 0.89 1" specular="0.5" shininess="0.6"/>
+    <material name="ball_mat" rgba="0.94 0.93 0.89 1" specular="0.35" shininess="0.45" reflectance="0.03"/>
+    <material name="bb8_orange" rgba="0.94 0.46 0.10 1" specular="0.3" shininess="0.35"/>
+    <material name="bb8_silver" rgba="0.74 0.75 0.77 1" specular="0.9" shininess="0.85" reflectance="0.15"/>
+    <material name="bb8_grey" rgba="0.58 0.59 0.61 1" specular="0.5" shininess="0.5"/>
+    <material name="bb8_dark" rgba="0.22 0.23 0.25 1" specular="0.4" shininess="0.4"/>
+    <material name="eye_black" rgba="0.02 0.02 0.03 1" specular="1" shininess="1" reflectance="0.3"/>
+    <material name="eye_red" rgba="0.95 0.08 0.06 1" emission="0.7" specular="1" shininess="1"/>
+    <material name="head_mat" rgba="0.95 0.94 0.90 1" specular="0.45" shininess="0.55" reflectance="0.04"/>
     <material name="metal_mat" rgba="0.55 0.57 0.60 1" specular="0.7"/>
     <material name="motor_mat" rgba="0.12 0.12 0.13 1"/>
     <material name="roller_mat" rgba="0.15 0.16 0.18 1"/>
     <material name="hub_mat" rgba="0.75 0.30 0.10 1"/>"""
+
+
+def _bb8_decor_assets(radius: float) -> str:
+    """Shared curved panel meshes for the BB-8 ball (defined once around +z, reused by many geoms)."""
+    m = []
+    for name, (a0, a1, az0, az1) in {
+            "pan_hub": (0.0, 0.16, 0, 2 * math.pi), "pan_hub_ring": (0.16, 0.19, 0, 2 * math.pi),
+            "pan_ring": (0.25, 0.42, 0, 2 * math.pi), "pan_rim": (0.42, 0.445, 0, 2 * math.pi),
+            "pan_spoke_a": (0.205, 0.245, 0.15, 1.75), "pan_spoke_b": (0.205, 0.245, 2.25, 3.85),
+            "pan_spoke_c": (0.205, 0.245, 4.35, 5.95),
+            "spot_hub": (0.0, 0.07, 0, 2 * math.pi), "spot_ring": (0.10, 0.17, 0, 2 * math.pi)}.items():
+        v, f = sphere_patch_mesh(radius * 1.0025, a0, a1, az0, az1, segs=56, rows=3 if a1 - a0 > 0.05 else 1)
+        m.append(_mesh_asset(name, v, f, shell=True))
+    return "\n    ".join(m)
 
 
 def _header(model_name: str, timestep: float) -> str:
@@ -316,8 +384,8 @@ def _header(model_name: str, timestep: float) -> str:
   <size memory="64M"/>
   <visual>
     <global offwidth="1920" offheight="1200" azimuth="135" elevation="-22"/>
-    <quality shadowsize="4096" offsamples="4"/>
-    <headlight ambient="0.35 0.35 0.38" diffuse="0.55 0.55 0.55" specular="0.1 0.1 0.1"/>
+    <quality shadowsize="4096" offsamples="8"/>
+    <headlight ambient="0.28 0.28 0.30" diffuse="0.45 0.45 0.45" specular="0.15 0.15 0.15"/>
     <map znear="0.01" zfar="60"/>
   </visual>"""
 
@@ -349,11 +417,26 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
         ball_geom = f'<geom name="ball_geom" type="sphere" size="{R:.5f}" material="ball_mat" {BALL_CT} priority="1" condim="6"/>'
 
     # head geometry heights (frame origin = ball centre)
+    Rh = rc.head_radius_m
     top_wheel = max(f.center[2] + f.radius * math.cos(f.zenith) for f in frames)
     plate_z = max(R + 0.015, top_wheel + 0.012)
-    dome_h = max(0.06, rc.head_radius_m * 0.72)
-    dv, df = dome_mesh(rc.head_radius_m, dome_h)
+    collar_h = 0.24 * Rh                      # cylindrical lower section of the head
+    dome_z = plate_z + collar_h
+    dome_h = max(0.06, rc.head_radius_m * 0.66)
+    dv, df = dome_mesh(Rh, dome_h, segments=48, rings=14)
     assets.append(_mesh_asset("dome_mesh", dv, df))
+    assets.append(_bb8_decor_assets(R))
+    bands = {"band_grey_low": (0.06, 0.16, 0, 2 * math.pi), "band_top_orange": (1.02, 1.10, 0, 2 * math.pi),
+             "band_top_cap": (1.18, 1.5707, 0, 2 * math.pi)}
+    for k in range(4):  # broken orange stripe (front / sides / back segments)
+        c = k * math.pi / 2 + math.pi / 4
+        bands[f"band_orange_{k}"] = (0.24, 0.33, c - 0.55, c + 0.55)
+    for k in range(3):  # small grey panels between the stripes
+        c = k * 2 * math.pi / 3 + 0.6
+        bands[f"band_panel_{k}"] = (0.42, 0.58, c - 0.22, c + 0.22)
+    for name, (p0, p1, a0, a1) in bands.items():
+        v, f = dome_band_mesh(Rh, dome_h, p0, p1, a0, a1)
+        assets.append(_mesh_asset(name, v, f, shell=True))
     if head_shell_mesh:
         assets.append(f'<mesh name="head_shell" file="{os.path.abspath(head_shell_mesh)}" '
                       f'scale="{head_shell_scale} {head_shell_scale} {head_shell_scale}"/>')
@@ -366,7 +449,7 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
     n_rollers = 2 * rc.rollers_per_row
     wheel_total = 3 * (hub_mass + n_rollers * roller_mass) if roller else 3 * 1e-3
     head_body_mass = max(0.1, m_head - wheel_total)
-    rh, hh = 0.11, 0.14
+    rh, hh = 0.75 * Rh, 0.14
     ih = (head_body_mass * (3 * rh ** 2 + hh ** 2) / 12, head_body_mass * (3 * rh ** 2 + hh ** 2) / 12,
           head_body_mass * rh ** 2 / 2)
     cog_z = R + rc.head_cog_height_m
@@ -379,7 +462,8 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
         rr = 0.4 * rw
         rcen = rw - rr
         motor_len = 0.04
-        motor_c = f.center - (0.5 * rc.wheel_width_m + motor_len / 2 + 0.004) * f.m
+        # stepper sits on the inner side of the wheel: shaft points inward/up (+axle) into the head
+        motor_c = f.center + (0.5 * rc.wheel_width_m + motor_len / 2 + 0.004) * f.m
         brk_top = np.array([motor_c[0], motor_c[1], plate_z])
         wheel_xml.append(
             f'<geom name="motor{i}_case" type="box" size="0.021 0.021 {motor_len / 2}" pos="{_v(motor_c)}" '
@@ -388,7 +472,10 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
             f'<geom name="motor{i}_bracket" type="capsule" fromto="{_v(motor_c)} {_v(brk_top)}" size="0.006" '
             f'material="metal_mat" {VIS}/>')
         wheel_xml.append(
-            f'<geom name="encoder{i}" type="cylinder" size="0.012 0.006" pos="{_v(motor_c - (motor_len / 2 + 0.006) * f.m)}" '
+            f'<geom name="motor{i}_shaft" type="cylinder" size="0.0025 {0.5 * rc.wheel_width_m / 2 + 0.004:.4f}" '
+            f'pos="{_v(f.center + (0.25 * rc.wheel_width_m + 0.002) * f.m)}" zaxis="{_v(f.m)}" material="bb8_silver" {VIS}/>')
+        wheel_xml.append(
+            f'<geom name="encoder{i}" type="cylinder" size="0.012 0.006" pos="{_v(motor_c + (motor_len / 2 + 0.006) * f.m)}" '
             f'zaxis="{_v(f.m)}" rgba="0.1 0.45 0.9 1" {VIS}/>')
         if roller:
             jw = (f'<joint name="wheel{i}_joint" type="hinge" axis="0 0 1" armature="{rc.stepper_rotor_inertia:.3g}" '
@@ -420,6 +507,41 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
             f'          <geom name="wheel{i}_marker" type="box" size="{rcen * 0.9:.5f} 0.002 {rc.wheel_width_m * 0.45:.5f}" '
             f'rgba="1 1 1 1" {VIS} mass="0"/>\n          ' + "\n          ".join(rollers) + "\n        </body>")
 
+    # --- BB-8 head decoration (visual only) ---------------------------------------
+    def dome_pt(phi: float, az: float) -> Tuple[np.ndarray, np.ndarray]:
+        pt = np.array([Rh * math.cos(phi) * math.cos(az), Rh * math.cos(phi) * math.sin(az), dome_z + dome_h * math.sin(phi)])
+        nrm = np.array([math.cos(phi) * math.cos(az) / Rh, math.cos(phi) * math.sin(az) / Rh, math.sin(phi) / dome_h])
+        return pt, nrm / np.linalg.norm(nrm)
+
+    band_mat = {"band_grey_low": "bb8_grey", "band_top_orange": "bb8_orange", "band_top_cap": "bb8_grey"}
+    deco = []
+    for name in bands:
+        mat = band_mat.get(name, "bb8_orange" if name.startswith("band_orange") else "bb8_grey")
+        deco.append(f'<geom name="head_{name}" type="mesh" mesh="{name}" pos="0 0 {dome_z:.4f}" material="{mat}" {VIS} mass="0"/>')
+    er = 0.27 * Rh                                    # main "radar eye"
+    p_eye, n_eye = dome_pt(0.62, 0.0)
+    c_eye = p_eye - 0.45 * er * n_eye
+    up = np.array([0.0, 0.0, 1.0])
+    deco += [
+        f'<geom name="head_eye_bezel" type="cylinder" size="{1.12 * er:.4f} 0.004" pos="{_v(p_eye - 0.003 * n_eye)}" zaxis="{_v(n_eye)}" material="bb8_dark" {VIS} mass="0"/>',
+        f'<geom name="head_eye" type="sphere" size="{er:.4f}" pos="{_v(c_eye)}" material="eye_black" {VIS} mass="0"/>',
+        f'<geom name="head_eye_lens" type="sphere" size="{0.34 * er:.4f}" pos="{_v(c_eye + 0.78 * er * n_eye)}" material="eye_red" {VIS} mass="0"/>',
+        f'<geom name="head_eye_glint" type="sphere" size="{0.07 * er:.4f}" pos="{_v(c_eye + 1.02 * er * n_eye + 0.25 * er * up)}" rgba="1 1 1 1" {VIS} mass="0"/>']
+    se = 0.11 * Rh                                    # small secondary eye
+    p_se, n_se = dome_pt(0.40, 0.55)
+    c_se = p_se - 0.4 * se * n_se
+    deco += [
+        f'<geom name="head_eye_small_ring" type="cylinder" size="{1.3 * se:.4f} 0.003" pos="{_v(p_se - 0.001 * n_se)}" zaxis="{_v(n_se)}" material="bb8_dark" {VIS} mass="0"/>',
+        f'<geom name="head_eye_small" type="sphere" size="{se:.4f}" pos="{_v(c_se)}" material="eye_black" {VIS} mass="0"/>',
+        f'<geom name="head_eye_small_glint" type="sphere" size="{0.18 * se:.4f}" pos="{_v(c_se + 0.95 * se * n_se + 0.3 * se * up)}" rgba="1 1 1 1" {VIS} mass="0"/>']
+    for nm, (ax, ay, length, rad) in {"long": (-0.18, -0.10, 0.95, 0.0028), "short": (-0.22, 0.06, 0.38, 0.0055)}.items():
+        x, y = ax * Rh, ay * Rh
+        z0 = dome_z + dome_h * math.sqrt(max(0.0, 1 - (x * x + y * y) / Rh ** 2)) - 0.003
+        z1 = z0 + length * Rh
+        deco += [f'<geom name="head_antenna_{nm}" type="capsule" fromto="{x:.4f} {y:.4f} {z0:.4f} {x:.4f} {y:.4f} {z1:.4f}" size="{rad}" material="bb8_silver" {VIS} mass="0"/>',
+                 f'<geom name="head_antenna_{nm}_base" type="cylinder" size="{2.6 * rad:.4f} 0.004" pos="{x:.4f} {y:.4f} {z0 + 0.003:.4f}" material="bb8_dark" {VIS} mass="0"/>']
+    head_decor = "\n        ".join(deco)
+
     head_shell = (f'<geom name="head_shell_import" type="mesh" mesh="head_shell" pos="0 0 {plate_z:.4f}" '
                   f'rgba="0.9 0.9 0.88 1" {VIS}/>' if head_shell_mesh else "")
     head_joint = ('<freejoint name="head_free"/>' if roller
@@ -429,24 +551,32 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
         <inertial pos="0 0 {cog_z:.5f}" mass="{head_body_mass:.4f}" diaginertia="{_v(ih)}"/>
         <site name="imu" pos="0 0 {R + rc.imu_height_m:.5f}" size="0.012" rgba="0.1 0.8 0.2 1" group="2"/>
         <site name="head_cog" pos="0 0 {cog_z:.5f}" size="0.01" rgba="1 0 1 1" group="3"/>
-        <geom name="head_plate" type="cylinder" size="{rc.head_radius_m * 0.98:.4f} 0.004" pos="0 0 {plate_z:.4f}" material="metal_mat" {HEAD_CT} mass="0"/>
-        <geom name="head_dome" type="mesh" mesh="dome_mesh" pos="0 0 {plate_z + 0.004:.4f}" material="head_mat" {HEAD_CT} mass="0"/>
-        <geom name="head_band" type="cylinder" size="{rc.head_radius_m * 1.005:.4f} 0.012" pos="0 0 {plate_z + 0.018:.4f}" material="bb8_orange" {VIS} mass="0"/>
-        <geom name="head_eye" type="sphere" size="0.028" pos="{rc.head_radius_m * 0.72:.4f} 0 {plate_z + dome_h * 0.62:.4f}" rgba="0.03 0.03 0.04 1" {VIS} mass="0"/>
-        <geom name="head_eye_small" type="sphere" size="0.011" pos="{rc.head_radius_m * 0.58:.4f} 0.05 {plate_z + dome_h * 0.86:.4f}" rgba="0.03 0.03 0.04 1" {VIS} mass="0"/>
-        <geom name="head_antenna" type="capsule" fromto="0 -0.03 {plate_z + dome_h:.4f} 0 -0.03 {plate_z + dome_h + 0.07:.4f}" size="0.003" material="metal_mat" {VIS} mass="0"/>
+        <geom name="head_plate" type="cylinder" size="{Rh * 0.97:.4f} 0.005" pos="0 0 {plate_z:.4f}" material="bb8_dark" {HEAD_CT} mass="0"/>
+        <geom name="head_collar" type="cylinder" size="{Rh:.4f} {collar_h / 2:.4f}" pos="0 0 {plate_z + collar_h / 2:.4f}" material="head_mat" {HEAD_CT} mass="0"/>
+        <geom name="head_rim" type="cylinder" size="{Rh * 1.02:.4f} 0.004" pos="0 0 {plate_z + 0.004:.4f}" material="bb8_silver" {VIS} mass="0"/>
+        <geom name="head_band" type="cylinder" size="{Rh * 1.012:.4f} {collar_h * 0.16:.4f}" pos="0 0 {plate_z + collar_h * 0.45:.4f}" material="bb8_orange" {VIS} mass="0"/>
+        <geom name="head_band_grey" type="cylinder" size="{Rh * 1.008:.4f} {collar_h * 0.07:.4f}" pos="0 0 {plate_z + collar_h * 0.8:.4f}" material="bb8_grey" {VIS} mass="0"/>
+        <geom name="head_dome" type="mesh" mesh="dome_mesh" pos="0 0 {dome_z:.4f}" material="head_mat" {HEAD_CT} mass="0"/>
+        {head_decor}
         <geom name="jetson_board" type="box" size="0.05 0.04 0.012" pos="0 0 {plate_z + 0.02:.4f}" rgba="0.1 0.5 0.2 1" group="3" contype="0" conaffinity="0" mass="0"/>
         {head_shell}
         """ + "\n        ".join(wheel_xml)
 
-    # decals on the ball (visual only) to make rolling visible
+    # BB-8 panels on the ball (visual only, also make rolling visible)
     decals = []
-    for k, d in enumerate([(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1),
-                           (0.577, 0.577, 0.577), (-0.577, -0.577, 0.577), (0.577, -0.577, -0.577),
-                           (-0.577, 0.577, -0.577)]):
-        rad = 0.36 * R if k < 6 else 0.22 * R
-        decals.append(f'<geom name="ball_decal_{k}" type="cylinder" size="{rad:.4f} 0.0015" pos="{_v(np.array(d) * (R + 0.0003))}" '
-                      f'zaxis="{_v(d)}" material="bb8_orange" {VIS} mass="0"/>')
+    axes6 = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+    diag8 = [(sx_ * 0.57735, sy_ * 0.57735, sz_ * 0.57735) for sx_ in (1, -1) for sy_ in (1, -1) for sz_ in (1, -1)]
+    big = (("pan_ring", "bb8_orange"), ("pan_rim", "bb8_silver"), ("pan_hub", "bb8_silver"),
+           ("pan_hub_ring", "bb8_dark"), ("pan_spoke_a", "bb8_orange"), ("pan_spoke_b", "bb8_orange"),
+           ("pan_spoke_c", "bb8_orange"))
+    for k, d in enumerate(axes6):
+        for mesh, mat in big:
+            decals.append(f'<geom name="ball_decal_{k}_{mesh}" type="mesh" mesh="{mesh}" zaxis="{_v(d)}" '
+                          f'material="{mat}" {VIS} mass="0"/>')
+    for k, d in enumerate(diag8):
+        for mesh, mat in (("spot_ring", "bb8_orange"), ("spot_hub", "bb8_grey")):
+            decals.append(f'<geom name="ball_spot_{k}_{mesh}" type="mesh" mesh="{mesh}" zaxis="{_v(d)}" '
+                          f'material="{mat}" {VIS} mass="0"/>')
 
     bb = cfg.randomization.ball
     ball_mass = bb.mass_kg.nominal()
@@ -485,15 +615,16 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
   <asset>{"".join(assets)}
   </asset>
   <worldbody>
-    <light name="key" pos="2 -2 5" dir="-0.4 0.4 -1" directional="true" castshadow="true" diffuse="0.7 0.7 0.68"/>
-    <light name="fill" pos="-3 2 4" dir="0.5 -0.3 -1" directional="true" castshadow="false" diffuse="0.25 0.27 0.3"/>
+    <light name="key" pos="2 -2 5" dir="-0.45 0.35 -1" directional="true" castshadow="true" diffuse="0.72 0.70 0.66" specular="0.35 0.35 0.35"/>
+    <light name="fill" pos="-3 2 4" dir="0.5 -0.3 -1" directional="true" castshadow="false" diffuse="0.22 0.25 0.30"/>
+    <light name="rim" pos="0 4 3" dir="0 -1 -0.4" directional="true" castshadow="false" diffuse="0.25 0.25 0.27" specular="0.4 0.4 0.4"/>
     {t_body}
     <body name="target" mocap="true" pos="{cfg.episode.target_x_m.nominal()} {cfg.episode.target_y_m.nominal()} 0.002">
       <geom name="target_disc" type="cylinder" size="0.09 0.002" rgba="0.2 0.95 0.4 0.55" {VIS}/>
       <geom name="target_pole" type="capsule" fromto="0 0 0 0 0 0.45" size="0.006" rgba="0.2 0.95 0.4 0.8" {VIS}/>
       <geom name="target_flag" type="box" size="0.045 0.002 0.025" pos="0.045 0 0.42" rgba="0.2 0.95 0.4 0.9" {VIS}/>
     </body>
-    <camera name="chase" mode="trackcom" pos="1.1 -1.1 0.75" xyaxes="0.707 0.707 0 -0.3 0.3 0.9"/>
+    <camera name="chase" mode="trackcom" pos="{4.4 * R:.3f} {-4.4 * R:.3f} {3.0 * R + 0.2:.3f}" xyaxes="0.707 0.707 0 -0.3 0.3 0.9"/>
     {bodies}
   </worldbody>
   <actuator>
@@ -538,7 +669,7 @@ def generate_validation_rig_xml(cfg: AppConfig, preload_n: Optional[float] = Non
                 f'<body name="roller_{row}_{k}" pos="{_v(pos)}"><joint name="roller_{row}_{k}_j" type="hinge" '
                 f'axis="{_v(ax)}" damping="0.001"/><geom name="roller_{row}_{k}_g" type="sphere" size="{rr:.5f}" '
                 f'mass="0.002" material="roller_mat" {ROLLER_CT} priority="4" condim="3" friction="1.0 0.005 0.0001"/></body>')
-    motor_c = -(0.5 * rc.wheel_width_m + 0.024) * np.array([0, 0, 1.0])
+    motor_c = (0.5 * rc.wheel_width_m + 0.024) * np.array([0, 0, 1.0])  # motor on the inner (+axle) side
     tq = rc.stepper_holding_torque_nm
     return f"""{_header("validation_rig_stepper_omniwheel", rc.physics_timestep_s)}
   <asset>{_common_assets()}

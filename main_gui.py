@@ -23,6 +23,12 @@ double-click select part, Ctrl+click / Ctrl+drag set the live waypoint target.
 """
 from __future__ import annotations
 
+import multiprocessing
+
+if __name__ == "__main__":
+    # Frozen (PyInstaller .exe) child processes must be intercepted before Qt / torch are imported.
+    multiprocessing.freeze_support()
+
 import collections
 import csv
 import math
@@ -96,10 +102,10 @@ class MjViewport(QtWidgets.QWidget):
         self.highlight_geoms = set()
         if not keep_camera and model is not None:
             mujoco.mjv_defaultFreeCamera(model, self.cam)
-            self.cam.distance = 1.7
-            self.cam.elevation = -18
-            self.cam.azimuth = 135
-            self.cam.lookat[:] = [0, 0, 0.2]
+            self.cam.distance = 2.4
+            self.cam.elevation = -14
+            self.cam.azimuth = 150
+            self.cam.lookat[:] = [0, 0, 0.36]
         self.error = None
         self.enabled = True
 
@@ -135,7 +141,7 @@ class MjViewport(QtWidgets.QWidget):
                 return
             if self.follow_body >= 0:
                 p = self.data.xpos[self.follow_body]
-                self.cam.lookat[:] = 0.85 * self.cam.lookat + 0.15 * np.array([p[0], p[1], p[2] + 0.08])
+                self.cam.lookat[:] = 0.85 * self.cam.lookat + 0.15 * np.array([p[0], p[1], p[2] + 0.12])
             r = self.renderer
             r.update_scene(self.data, camera=self.cam, scene_option=self.opt)
             if self.highlight_geoms:
@@ -2210,10 +2216,16 @@ def main(argv=None):
     ap.add_argument("--mode", choices=["single", "grid", "headless"])
     ap.add_argument("--screenshot", help="render the window to PNG after N seconds and quit (CI / docs)")
     ap.add_argument("--screenshot-delay", type=float, default=3.0)
+    ap.add_argument("--self-test", action="store_true",
+                    help="headless check of physics, ONNX/C++ export and a short multi-process training run")
     args = ap.parse_args(argv)
+    if args.self_test:
+        return self_test(args.workspace)
     cfg = AppConfig.load(args.config) if args.config else default_config()
     if args.workspace:
         cfg.workspace_dir = args.workspace
+    elif getattr(sys, "frozen", False):  # packaged .exe: keep the workspace next to the executable
+        cfg.workspace_dir = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "workspace")
     if args.mode:
         cfg.viewer.mode = args.mode
     QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
@@ -2233,6 +2245,46 @@ def main(argv=None):
     return ret
 
 
+def self_test(workspace: Optional[str] = None) -> int:
+    """Used by build_exe.bat to verify a packaged .exe (frozen multiprocessing included)."""
+    ws = workspace or os.path.join(tempfile.gettempdir(), f"bb8_selftest_{os.getpid()}")
+    cfg = default_config()
+    cfg.workspace_dir = ws
+    t0 = time.time()
+    try:
+        env = BB8BalanceEnv(cfg)
+        env.reset(seed=0)
+        for _ in range(50):
+            env.step(env.action_space.sample())
+        print(f"[1/3] physics OK ({cfg.robot.ball_radius_m * 200:.0f} cm ball)", flush=True)
+        ensure_initial_policy(cfg)
+        generate_cpp(PolicySnapshot.load_json(os.path.join(ws, "initial_policy.json")), os.path.join(ws, "exports"))
+        print("[2/3] cold-start ONNX + C++ export OK", flush=True)
+        tc = cfg.training
+        tc.n_envs, tc.vec_env, tc.n_steps, tc.batch_size, tc.n_epochs = 2, "subproc", 256, 128, 1
+        tc.total_timesteps, tc.best_window_episodes = 1024, 2
+        cfg.viewer.mode = "headless"
+        ctl = TrainingController()
+        ctl.start(cfg)
+        msgs = []
+        while time.time() - t0 < 600:
+            msgs += ctl.poll()
+            if any(m["type"] == "finished" for m in msgs):
+                break
+            time.sleep(0.2)
+        ctl.kill()
+        errs = [m for m in msgs if m["type"] == "error"]
+        if errs or not any(m["type"] == "episode" for m in msgs):
+            print("[3/3] training FAILED:\n" + (errs[0]["trace"] if errs else "no episodes / timeout"), flush=True)
+            return 1
+        print(f"[3/3] multi-process training OK ({sum(m['type'] == 'episode' for m in msgs)} episodes)", flush=True)
+        print(f"SELF-TEST PASSED in {time.time() - t0:.0f} s  (workspace {ws})", flush=True)
+        return 0
+    except Exception:
+        traceback.print_exc()
+        return 1
+
+
 def shutdown_qt(app, win) -> None:
     """Destroy widgets while the interpreter is alive (avoids pyqtgraph/PySide atexit teardown errors)."""
     win.deleteLater()
@@ -2242,6 +2294,4 @@ def shutdown_qt(app, win) -> None:
 
 
 if __name__ == "__main__":
-    mp_ctx = __import__("multiprocessing")
-    mp_ctx.freeze_support()
     sys.exit(main())

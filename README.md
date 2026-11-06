@@ -68,7 +68,8 @@ native Qt widget.
 | `mjcf_generator.py` | Procedural MJCF: BB-8 ballbot, validation rig, dented sphere mesh, terrain, importer, omniwheel geometry/Jacobian |
 | `bb8_gym_env.py` | Gymnasium env with full domain randomisation, stepper/TMC2208 model, IMU noise+drift, pushes, falls, waypoints; `ValidationRigSim` |
 | `rl_onnx_cpp_engine.py` | Cold-start ONNX, ONNX/C++ exporters, SB3 bridge, training worker process, process-tree governor |
-| `main_gui.py` | The desktop application |
+| `main_gui.py` | The desktop application (`--self-test` for headless verification) |
+| `build_exe.bat`, `bb8_studio.spec` | One-click Windows `.exe` build (PyInstaller) |
 | `deployment_jetson/` | Arduino firmware, Jetson Python & C++ runners, CMake, hardware config |
 | `tests/` | Headless smoke tests + scripted end-to-end GUI exercise |
 
@@ -100,6 +101,29 @@ Training is initialised **from these exact weights**, so every run starts from a
 
 > **Linux without a display / remote CI:** `MUJOCO_GL=egl` (GPU) or `MUJOCO_GL=osmesa` (CPU) with
 > `QT_QPA_PLATFORM=offscreen`. On normal desktops nothing needs to be set.
+
+### Building a standalone Windows `.exe`
+
+Double-click **`build_exe.bat`** (or run it from a terminal in the repo folder). It needs 64-bit Python
+3.10–3.12 from python.org on `PATH`, and it does the following:
+
+1. Creates an isolated `.venv-build\` and installs `requirements.txt` + PyInstaller (~1 GB download on the first run).
+2. Runs a quick import/physics self-test.
+3. Builds with `bb8_studio.spec`.
+4. Launches the packaged exe with `--self-test`, which runs physics, the ONNX/C++ exports and a short
+   **multi-process** training run with SubprocVecEnv workers. This catches packaging problems before you
+   ship the exe.
+
+| Command | Result |
+|---|---|
+| `build_exe.bat` | `dist\BB8_RL_Studio\BB8_RL_Studio.exe`. Zip and ship the whole folder (~1.3–1.6 GB with CPU PyTorch). Starts fast. **Recommended.** |
+| `build_exe.bat onefile` | a single `dist\BB8_RL_Studio.exe`. Slower start-up, because PyTorch is unpacked to `%TEMP%` on every launch. |
+| `build_exe.bat console` | same, but keeps a console window for logs and tracebacks |
+| `build_exe.bat notest` | skips the post-build self-test |
+
+The packaged app creates its `workspace\` next to the exe. You can always re-check a build with
+`BB8_RL_Studio.exe --self-test`. The same spec also builds on Linux/macOS:
+`pyinstaller --noconfirm bb8_studio.spec`.
 
 ---
 
@@ -142,6 +166,11 @@ restores the exact live state and continues.
 ## 4. Physics model
 
 ### Geometry (head frame, origin at ball centre)
+Defaults: **50 cm ball** (R = 0.25 m, 2.0–3.0 kg randomised: an estimate for a hollow styrofoam
+core with an epoxy/sawdust shell, so weigh yours and set *Randomization → Ball → Mass*), a 30 cm head
+(BB-8 proportions), 2.2 kg head mass, 58 mm omniwheels. Each stepper sits on the **inner side of its wheel**
+(its shaft points inward/up along +m<sub>i</sub>), tucked under the head plate.
+
 For wheel *i* with azimuth α<sub>i</sub> ∈ {0°,120°,240°} and zenith θ (31° now, 40° target):
 
 * contact normal  n<sub>i</sub> = (sinθ cosα, sinθ sinα, cosθ),  contact point  p<sub>i</sub> = R n<sub>i</sub>

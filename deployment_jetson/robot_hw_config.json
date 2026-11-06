@@ -1,7 +1,7 @@
 {
   "_comment": "Flat JSON shared by jetson_control_loop.py and jetson_control_loop.cpp. Geometry MUST match the simulator config used for training.",
   "control_hz": 100.0,
-  "ball_radius_m": 0.125,
+  "ball_radius_m": 0.25,
   "wheel_radius_m": 0.029,
   "zenith_angle_deg": 31.0,
   "wheel_azimuths_deg": [0.0, 120.0, 240.0],

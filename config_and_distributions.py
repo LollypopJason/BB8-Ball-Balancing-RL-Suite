@@ -172,6 +172,7 @@ class RobotGeometryConfig:
     wheel_diameter_m: float = DEFAULT_WHEEL_DIAMETER_M
     wheel_width_m: float = 0.024
     rollers_per_row: int = 6                 # multi-roller approximation (2 staggered rows)
+    roller_radius_frac: float = 0.8          # roller sphere radius / wheel radius (0.8 -> 0.85 % envelope ripple)
     omniwheel_model: str = "virtual"         # "virtual" (Jacobian transmission) | "roller" (contact rollers)
     head_mass_kg: float = 2.2
     head_radius_m: float = 0.15              # head dome radius (30 cm head, BB-8 proportions)
@@ -185,7 +186,9 @@ class RobotGeometryConfig:
     stepper_corner_speed_rads: float = 15.0  # pull-out torque starts dropping above this speed
     stepper_max_speed_rads: float = 45.0     # command saturation (~430 rpm)
     stepper_torque_at_max_frac: float = 0.35 # remaining torque fraction at max speed
-    physics_timestep_s: float = 0.002        # 500 Hz physics
+    physics_timestep_s: float = 0.002        # 500 Hz physics ("virtual" omniwheel model)
+    roller_timestep_s: float = 0.001         # 1 kHz physics for the "roller" model / validation rig
+    roller_contact_timeconst_s: float = 0.002  # roller-ball contact solref time constant (>= 2 x roller_timestep_s)
     control_hz: float = 100.0                # Jetson control loop rate
 
     @property
@@ -193,8 +196,19 @@ class RobotGeometryConfig:
         return 0.5 * self.wheel_diameter_m
 
     @property
+    def sim_timestep_s(self) -> float:
+        """MuJoCo timestep actually simulated. The roller model's head rests on stiff, discrete
+        roller contacts whose time constant must be resolved by several steps, so it runs finer."""
+        return self.roller_timestep_s if self.omniwheel_model == "roller" else self.physics_timestep_s
+
+    @property
     def frame_skip(self) -> int:
-        return max(1, int(round(1.0 / (self.control_hz * self.physics_timestep_s))))
+        """Physics sub-steps per control step."""
+        return max(1, int(round(1.0 / (self.control_hz * self.sim_timestep_s))))
+
+    @property
+    def control_dt_s(self) -> float:
+        return self.frame_skip * self.sim_timestep_s
 
     @property
     def steps_per_rad(self) -> float:

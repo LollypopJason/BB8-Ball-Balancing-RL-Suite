@@ -81,7 +81,7 @@ class BB8BalanceEnv(gym.Env):
         self.model_overrides: List[Tuple[str, str, str, Any]] = []  # live inspector edits
 
         rc = self.cfg.robot
-        self.dt_ctrl = rc.frame_skip * rc.physics_timestep_s
+        self.dt_ctrl = rc.control_dt_s
         self.max_steps = int(round(self.cfg.episode.max_episode_s / self.dt_ctrl))
         self.obs_idx = np.array(active_obs_indices(self.cfg.network.obs_mask), dtype=np.int64)
         self.act_idx = active_action_indices(self.cfg.network.action_mask)
@@ -366,8 +366,8 @@ class BB8BalanceEnv(gym.Env):
         self.target_enabled = bool(options.get("target_enabled", ep.target_enabled))
         d.mocap_pos[self.target_mocap] = [self.target[0], self.target[1], 0.002 if self.target_enabled else -5.0]
         mujoco.mj_forward(m, d)
-        if self.roller_mode:  # settle the head onto the rollers
-            for _ in range(50):
+        if self.roller_mode:  # settle the head onto the (stiff) roller contacts: 50 ms, wheels held
+            for _ in range(max(1, int(round(0.05 / m.opt.timestep)))):
                 mujoco.mj_step(m, d)
             d.qvel[:] = 0
             d.time = 0.0
@@ -390,7 +390,7 @@ class BB8BalanceEnv(gym.Env):
         """Apply a new configuration; takes effect (incl. recompilation) on next reset."""
         self.cfg = cfg.copy()
         self._structural_key = None
-        self.dt_ctrl = self.cfg.robot.frame_skip * self.cfg.robot.physics_timestep_s
+        self.dt_ctrl = self.cfg.robot.control_dt_s
         self.max_steps = int(round(self.cfg.episode.max_episode_s / self.dt_ctrl))
 
     # ------------------------------------------------------------ helpers
@@ -492,8 +492,11 @@ class BB8BalanceEnv(gym.Env):
         """Run ``frame_skip`` physics sub-steps with the stepper/TMC2208 model:
         speed-dependent pull-out torque x supply-voltage scale, traction-limited
         slip (virtual model), missed-step accounting and encoder integration."""
+        if self.roller_mode and not self.torque_mode:
+            self._integrate_roller_servo(cmd)
+            return
         rc, m, d = self.cfg.robot, self.model, self.data
-        dt, spr = rc.physics_timestep_s, rc.steps_per_rad
+        dt, spr = rc.sim_timestep_s, rc.steps_per_rad
         tq = rc.stepper_holding_torque_nm * self.p["v_scale"]
         corner = rc.stepper_corner_speed_rads
         span = max(rc.stepper_max_speed_rads - corner, 1e-6)
@@ -533,6 +536,56 @@ class BB8BalanceEnv(gym.Env):
             self.enc_pos = d.qpos[self._wqadr].copy()
         self.slip = slip
         self.enc_vel = np.asarray(enc_v, dtype=np.float64).copy()
+        self.motor_torque = d.actuator_force.copy()
+
+    def _integrate_roller_servo(self, cmd: np.ndarray) -> None:
+        """Roller model, velocity (step-rate) commands: same stepper model as ``_integrate``
+        (speed-dependent pull-out torque x supply scale, missed-step accounting), written with
+        Python scalars because the roller model runs 10 sub-steps per control step.
+
+        Saturation is modelled as a reduced servo stiffness ``kv_eff = min(kv, limit/|cmd - w|)``
+        rather than by clamping the force (``forcerange``): the wheel's own inertia (~2e-5 kg m^2)
+        is tiny, so a *clamped* servo force (explicit, without the implicit velocity damping of
+        ``implicitfast``) overshoots the command by tau*dt/I ~ 20-40 rad/s in a single step and the
+        wheel chatters on and off the ball. With ``kv_eff`` the force still equals the pull-out
+        limit, but stays implicit and can never overshoot - a stepper cannot outrun its step train.
+        Traction (slip) is handled by the real roller-ball friction contacts."""
+        rc, m, d = self.cfg.robot, self.model, self.data
+        dt, spr = rc.sim_timestep_s, rc.steps_per_rad
+        tq = rc.stepper_holding_torque_nm * self.p["v_scale"]
+        corner = rc.stepper_corner_speed_rads
+        span = max(rc.stepper_max_speed_rads - corner, 1e-6)
+        drop = 1.0 - rc.stepper_torque_at_max_frac
+        kv = rc.stepper_kv * self.p["kv_scale"]
+        gain, bias, fr = m.actuator_gainprm, m.actuator_biasprm, m.actuator_forcerange
+        qvel, force = d.qvel, d.actuator_force
+        dofs = [int(i) for i in self._wdadr]
+        c = [float(v) for v in cmd]
+        d.ctrl[:] = cmd
+        lim = [0.0, 0.0, 0.0]
+        missed = [0.0, 0.0, 0.0]
+        for _ in range(rc.frame_skip):
+            for i in range(3):
+                w = float(qvel[dofs[i]])
+                a = abs(w)
+                L = tq if a <= corner else tq * (1.0 - drop * min((a - corner) / span, 1.0))
+                e = abs(c[i] - w)
+                k = kv if e * kv <= L else L / e
+                gain[i, 0] = k
+                bias[i, 2] = -k
+                fr[i, 0] = -1.000001 * L          # force <= L by construction: keep the clamp inactive
+                fr[i, 1] = 1.000001 * L
+                lim[i] = L
+            if self.push_next_t != math.inf or self.push_end_t > 0:
+                self._update_push()
+            mujoco.mj_step(m, d)
+            for i in range(3):
+                if abs(force[i]) >= 0.98 * lim[i]:
+                    missed[i] += abs(c[i] - float(qvel[dofs[i]])) * dt * spr
+        self.missed_steps += missed
+        self.enc_pos = d.qpos[self._wqadr].copy()
+        self.slip = np.zeros(3, dtype=bool)
+        self.enc_vel = d.qvel[self._wdadr].astype(np.float64)
         self.motor_torque = d.actuator_force.copy()
 
     def stepper_torque_limit(self, speed: np.ndarray) -> np.ndarray:
@@ -705,14 +758,18 @@ class ValidationRigSim:
 
     def step(self, cmd_rads: float, duration_s: float = 0.01) -> Dict[str, float]:
         m, d, rc = self.model, self.data, self.cfg.robot
-        n = max(1, int(round(duration_s / rc.physics_timestep_s)))
+        n = max(1, int(round(duration_s / m.opt.timestep)))
         for _ in range(n):
             w = d.qvel[self.wheel_dof]
             s = abs(w)
             frac = 1.0 - (1.0 - rc.stepper_torque_at_max_frac) * min(1.0, max(0.0, (s - rc.stepper_corner_speed_rads) /
                                                                              (rc.stepper_max_speed_rads - rc.stepper_corner_speed_rads)))
             lim = rc.stepper_holding_torque_nm * self.v_scale * frac
-            m.actuator_forcerange[0] = [-lim, lim]
+            # saturation as a reduced (still implicit) servo stiffness, see BB8BalanceEnv._integrate_roller_servo
+            kv = min(rc.stepper_kv, lim / max(abs(cmd_rads - w), 1e-9))
+            m.actuator_gainprm[0, 0] = kv
+            m.actuator_biasprm[0, 2] = -kv
+            m.actuator_forcerange[0] = [-lim * 1.000001, lim * 1.000001]
             d.ctrl[0] = cmd_rads
             mujoco.mj_step(m, d)
         v = np.zeros(6)

@@ -33,6 +33,9 @@ Omniwheel modelling (two selectable fidelity levels)
     carrying 2 staggered rows of passive rollers (hinge joints about the rim tangent)
     whose sphere geoms make real frictional contact with the ball. This is the
     multi-roller approximation (stock MuJoCo cannot orient anisotropic friction).
+    Large overlapping roller spheres (``roller_radius_frac``) keep the envelope ripple
+    < 1 %, and the stiff roller contacts run at ``roller_timestep_s`` (1 ms) - see
+    ``omniwheel_roller_layout`` / ``roller_contact_xml``.
 """
 from __future__ import annotations
 
@@ -54,7 +57,7 @@ from config_and_distributions import AppConfig, RobotGeometryConfig, TerrainConf
 #   head shell       : contype 4, conaffinity 4 (collide only with ground when fallen)
 GROUND_CT = 'contype="1" conaffinity="5"'
 BALL_CT = 'contype="1" conaffinity="3"'
-ROLLER_CT = 'contype="2" conaffinity="0" solref="0.004 1" solimp="0.95 0.99 0.001"'
+ROLLER_CT = 'contype="2" conaffinity="0"'   # + solref/solimp from roller_contact_xml()
 HEAD_CT = 'contype="4" conaffinity="4"'
 VIS = 'contype="0" conaffinity="0" group="1"'
 
@@ -375,10 +378,12 @@ def _bb8_decor_assets(radius: float) -> str:
     return "\n    ".join(m)
 
 
-def _header(model_name: str, timestep: float) -> str:
+def _header(model_name: str, timestep: float, sparse: bool = False) -> str:
+    # the roller models have ~40-50 dofs in a shallow tree: the sparse solver path is ~1.5x faster
+    jac = ' jacobian="sparse"' if sparse else ""
     return f"""<mujoco model="{model_name}">
   <compiler angle="degree" autolimits="true" inertiafromgeom="auto"/>
-  <option timestep="{timestep}" integrator="implicitfast" cone="elliptic" impratio="10" noslip_iterations="0">
+  <option timestep="{timestep}" integrator="implicitfast" cone="elliptic" impratio="10" noslip_iterations="0"{jac}>
     <flag multiccd="enable"/>
   </option>
   <size memory="64M"/>
@@ -388,6 +393,61 @@ def _header(model_name: str, timestep: float) -> str:
     <headlight ambient="0.28 0.28 0.30" diffuse="0.45 0.45 0.45" specular="0.15 0.15 0.15"/>
     <map znear="0.01" zfar="60"/>
   </visual>"""
+
+
+# ============================================================================
+# Multi-roller omniwheel (shared by the "roller" ballbot model and the validation rig)
+# ============================================================================
+ROLLER_MASS = 0.002
+VIS_ROLLER_R, VIS_ROLLER_CEN = 0.4, 0.6     # visual roller radius / centre radius (x wheel radius)
+
+
+def roller_contact_xml(rc: RobotGeometryConfig) -> str:
+    """Contact attributes of the roller spheres (they have priority over the ball).
+
+    The head of the roller model is a free body resting on three point contacts, so the
+    roller-ball contact stiffness sets a head "rocking" mode. With a soft contact
+    (solref 4 ms at 2 ms steps) that mode sits at ~15 Hz, is poorly resolved, and the IMU
+    sees it -> any balance controller with a useful bandwidth chatters the steppers into
+    saturation and the head hops off the rollers. A 2 ms time constant resolved by 1 ms
+    steps (``roller_timestep_s``) keeps the mode far above the balance dynamics, like the
+    hard rubber rollers of a real omniwheel (~0.05 mm static deflection)."""
+    tc = max(rc.roller_contact_timeconst_s, 2.0 * rc.roller_timestep_s)
+    return f'{ROLLER_CT} solref="{tc:.6g} 1" solimp="0.95 0.99 0.001" priority="4" condim="3"'
+
+
+def omniwheel_roller_layout(rc: RobotGeometryConfig, wheel_radius: float):
+    """Roller sphere radius and (row, k, centre, hinge axis) of every roller in the wheel frame
+    (wheel axle = local z). Two staggered rows of ``rollers_per_row`` spheres approximate the
+    roller envelope; large spheres close to the hub (``roller_radius_frac`` ~0.8) keep the
+    envelope ripple below 1 % and the contact-normal jump between rollers below ~8 deg (the
+    former 0.4 r spheres gave 5 % / 46 deg, i.e. a cogging "bump" 12 times per revolution).
+    The hinge axis is the rim tangent, so the passive roller spin frees exactly the lateral
+    (axle-direction) slip at the contact, whichever roller touches."""
+    rr = rc.roller_radius_frac * wheel_radius
+    rcen = wheel_radius - rr
+    offs = rc.wheel_width_m / 4
+    out = []
+    for row in range(2):
+        for k in range(rc.rollers_per_row):
+            b = 2 * math.pi * (k + 0.5 * row) / rc.rollers_per_row
+            out.append((row, k, (rcen * math.cos(b), rcen * math.sin(b), offs if row else -offs),
+                        (-math.sin(b), math.cos(b), 0.0)))
+    return rr, out
+
+
+def omniwheel_envelope(rc: RobotGeometryConfig, wheel_radius: float, n: int = 3600) -> np.ndarray:
+    """Effective rolling radius of the roller envelope vs. wheel angle (for diagnostics/tests)."""
+    rr, layout = omniwheel_roller_layout(rc, wheel_radius)
+    ang = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    d = np.stack([np.cos(ang), np.sin(ang)], 1)
+    best = np.zeros(n)
+    for _, _, c, _ in layout:
+        p = np.asarray(c[:2])
+        along = d @ p
+        perp2 = (p @ p) - along ** 2
+        best = np.maximum(best, along + np.sqrt(np.maximum(rr ** 2 - perp2, 0.0)))
+    return best
 
 
 # ============================================================================
@@ -445,7 +505,7 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
         assets.append(t_asset)
 
     m_head = rc.head_mass_kg
-    hub_mass, roller_mass = 0.035, 0.002
+    hub_mass, roller_mass = 0.035, ROLLER_MASS
     n_rollers = 2 * rc.rollers_per_row
     wheel_total = 3 * (hub_mass + n_rollers * roller_mass) if roller else 3 * 1e-3
     head_body_mass = max(0.1, m_head - wheel_total)
@@ -459,8 +519,7 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
     for f in frames:
         i = f.index + 1
         rw = f.radius
-        rr = 0.4 * rw
-        rcen = rw - rr
+        rcen = VIS_ROLLER_CEN * rw                 # visual hub / roller layout
         motor_len = 0.04
         # stepper sits on the inner side of the wheel: shaft points inward/up (+axle) into the head
         motor_c = f.center + (0.5 * rc.wheel_width_m + motor_len / 2 + 0.004) * f.m
@@ -485,21 +544,22 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
             jw = f'<joint name="wheel{i}_joint" type="hinge" axis="0 0 1" damping="0"/>'
             winert = '<inertial pos="0 0 0" mass="0.001" diaginertia="1e-6 1e-6 1e-6"/>'
         rollers = []
-        offs = rc.wheel_width_m / 4
-        for row in range(2):
-            for k in range(rc.rollers_per_row):
-                b = 2 * math.pi * (k + 0.5 * row) / rc.rollers_per_row
-                pos = (rcen * math.cos(b), rcen * math.sin(b), (offs if row else -offs))
-                ax = (-math.sin(b), math.cos(b), 0)
-                if roller:
-                    rollers.append(
-                        f'<body name="w{i}_roller_{row}_{k}" pos="{_v(pos)}">'
-                        f'<joint name="w{i}_roller_{row}_{k}_j" type="hinge" axis="{_v(ax)}" damping="0.001"/>'
-                        f'<geom name="w{i}_roller_{row}_{k}_g" type="sphere" size="{rr:.5f}" mass="{roller_mass}" '
-                        f'material="roller_mat" {ROLLER_CT} priority="4" condim="3" friction="1.0 0.005 0.0001"/>'
-                        f'</body>')
-                else:
-                    rollers.append(f'<geom type="sphere" size="{rr:.5f}" pos="{_v(pos)}" material="roller_mat" {VIS}/>')
+        rr, layout = omniwheel_roller_layout(rc, rw)
+        for row, k, pos, ax in layout:
+            b = 2 * math.pi * (k + 0.5 * row) / rc.rollers_per_row
+            # small visual roller at its usual place (the large collision spheres would look like a blob)
+            vis_c = np.array([rcen * math.cos(b), rcen * math.sin(b), pos[2]])
+            vis = lambda p: (f'<geom type="sphere" size="{VIS_ROLLER_R * rw:.5f}" pos="{_v(p)}" '
+                             f'material="roller_mat" {VIS} mass="0"/>')
+            if roller:
+                rollers.append(
+                    f'<body name="w{i}_roller_{row}_{k}" pos="{_v(pos)}">'
+                    f'<joint name="w{i}_roller_{row}_{k}_j" type="hinge" axis="{_v(ax)}" damping="0.001"/>'
+                    f'<geom name="w{i}_roller_{row}_{k}_g" type="sphere" size="{rr:.5f}" mass="{roller_mass}" '
+                    f'group="3" rgba="0.15 0.16 0.18 0.35" {roller_contact_xml(rc)} friction="1.0 0.005 0.0001"/>'
+                    f'{vis(vis_c - np.asarray(pos))}</body>')
+            else:
+                rollers.append(vis(vis_c))
         wheel_xml.append(
             f'<body name="wheel{i}" pos="{_v(f.center)}" zaxis="{_v(f.m)}">\n          {jw}\n          {winert}\n'
             f'          <geom name="wheel{i}_hub" type="cylinder" size="{rcen * 0.95:.5f} {rc.wheel_width_m * 0.42:.5f}" '
@@ -611,7 +671,7 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
             acts.append(f'<velocity name="motor{i}" {tr} kv="{rc.stepper_kv}" ctrlrange="{-rc.stepper_max_speed_rads} '
                         f'{rc.stepper_max_speed_rads}" forcerange="{-tq} {tq}"/>')
 
-    xml = f"""{_header("bb8_head_balancing_ballbot", rc.physics_timestep_s)}
+    xml = f"""{_header("bb8_head_balancing_ballbot", rc.sim_timestep_s, sparse=roller)}
   <asset>{"".join(assets)}
   </asset>
   <worldbody>
@@ -656,22 +716,21 @@ def generate_validation_rig_xml(cfg: AppConfig, preload_n: Optional[float] = Non
     cz = R + 0.35
     ball_mass = cfg.randomization.ball.mass_kg.nominal()
     I = rc.ball_inertia_factor * ball_mass * R ** 2
-    rr = 0.4 * rw
-    rcen = rw - rr
-    offs = rc.wheel_width_m / 4
+    rcen = VIS_ROLLER_CEN * rw
+    rr, layout = omniwheel_roller_layout(rc, rw)
     rollers = []
-    for row in range(2):
-        for k in range(rc.rollers_per_row):
-            b = 2 * math.pi * (k + 0.5 * row) / rc.rollers_per_row
-            pos = (rcen * math.cos(b), rcen * math.sin(b), (offs if row else -offs))
-            ax = (-math.sin(b), math.cos(b), 0)
-            rollers.append(
-                f'<body name="roller_{row}_{k}" pos="{_v(pos)}"><joint name="roller_{row}_{k}_j" type="hinge" '
-                f'axis="{_v(ax)}" damping="0.001"/><geom name="roller_{row}_{k}_g" type="sphere" size="{rr:.5f}" '
-                f'mass="0.002" material="roller_mat" {ROLLER_CT} priority="4" condim="3" friction="1.0 0.005 0.0001"/></body>')
+    for row, k, pos, ax in layout:
+        b = 2 * math.pi * (k + 0.5 * row) / rc.rollers_per_row
+        vis_c = np.array([rcen * math.cos(b), rcen * math.sin(b), pos[2]]) - np.asarray(pos)
+        rollers.append(
+            f'<body name="roller_{row}_{k}" pos="{_v(pos)}"><joint name="roller_{row}_{k}_j" type="hinge" '
+            f'axis="{_v(ax)}" damping="0.001"/><geom name="roller_{row}_{k}_g" type="sphere" size="{rr:.5f}" '
+            f'mass="{ROLLER_MASS}" group="3" rgba="0.15 0.16 0.18 0.35" {roller_contact_xml(rc)} '
+            f'friction="1.0 0.005 0.0001"/><geom type="sphere" size="{VIS_ROLLER_R * rw:.5f}" pos="{_v(vis_c)}" '
+            f'material="roller_mat" {VIS} mass="0"/></body>')
     motor_c = (0.5 * rc.wheel_width_m + 0.024) * np.array([0, 0, 1.0])  # motor on the inner (+axle) side
     tq = rc.stepper_holding_torque_nm
-    return f"""{_header("validation_rig_stepper_omniwheel", rc.physics_timestep_s)}
+    return f"""{_header("validation_rig_stepper_omniwheel", rc.roller_timestep_s, sparse=True)}
   <asset>{_common_assets()}
   </asset>
   <worldbody>
@@ -782,7 +841,7 @@ def import_custom_model(cfg: AppConfig) -> str:
         if b.import_mode == "head_shell":
             return generate_bb8_xml(cfg, head_shell_mesh=path, head_shell_scale=b.mesh_scale)
         s = b.mesh_scale
-        return f"""{_header("imported_mesh", cfg.robot.physics_timestep_s)}
+        return f"""{_header("imported_mesh", cfg.robot.sim_timestep_s)}
   <asset>{_common_assets()}
     <mesh name="imported" file="{path}" scale="{s} {s} {s}"/>
   </asset>

@@ -67,6 +67,7 @@ native Qt widget.
 | `config_and_distributions.py` | `DistributionParameter` (Constant / Uniform / Normal + clamping), every config dataclass, observation/action channel spec (single source of truth for ordering, units, normalisation), JSON & experiment-ZIP serialisation, Dark/Light themes |
 | `mjcf_generator.py` | Procedural MJCF: BB-8 ballbot, validation rig, dented sphere mesh, terrain, importer, omniwheel geometry/Jacobian |
 | `bb8_gym_env.py` | Gymnasium env with full domain randomisation, stepper/TMC2208 model, IMU noise+drift, pushes, falls, waypoints; `ValidationRigSim` |
+| `classical_controller.py` | Model-based pole-placement balance controller (IMU + encoders only) – baseline and plant/fidelity check for both omniwheel models |
 | `rl_onnx_cpp_engine.py` | Cold-start ONNX, ONNX/C++ exporters, SB3 bridge, training worker process, process-tree governor |
 | `main_gui.py` | The desktop application (`--self-test` for headless verification) |
 | `build_exe.bat`, `bb8_studio.spec` | One-click Windows `.exe` build (PyInstaller) |
@@ -187,11 +188,30 @@ For wheel *i* with azimuth α<sub>i</sub> ∈ {0°,120°,240°} and zenith θ (3
 | Lateral roller friction | damping along roller directions on the ball-joint DoFs | roller hinge damping |
 | Longitudinal grip / slip | traction limit μ<sub>i</sub>·N·r<sub>i</sub> on actuator force, slip flag, slipping encoder spins to command | contact friction |
 | Rotor inertia | reflected `dof_armature` = J<sub>rotor</sub>·diag(JᵀJ) | hinge `armature` |
-| Speed (1 core, 100 Hz control, 500 Hz physics) | ~2.7–3.5 k control steps/s | ~2× slower |
+| Physics step | `physics_timestep_s` (2 ms) | `roller_timestep_s` (1 ms), sparse Jacobian |
+| Speed (1 core, 100 Hz control) | ~2.7–3.5 k control steps/s | ~1.0–1.1 k control steps/s (≈3× slower) |
 
 Stock MuJoCo cannot orient anisotropic (orthotropic) friction in the contact frame, so the virtual model
 reproduces omniwheel kinematics exactly and the roller model reproduces them through contacts. The
-validation rig measures the roller model's transmission ratio within ≈5 % of R/r (roller envelope ripple).
+validation rig measures the roller model's transmission ratio within ≈1 % of R/r (mean; ±5 % instantaneous).
+
+**Roller model settings (and why).** The free head rests on three point contacts, so it has a "rocking"
+mode set by the roller–ball contact stiffness, and every stepper torque transient (micro-step command
+quantisation, controller action) excites it. The model therefore uses:
+
+* **Large, overlapping roller spheres** (`roller_radius_frac` = 0.8 of the wheel radius, 2 × 6 rollers): envelope
+  ripple 0.85 % and a 7° contact-normal jump between rollers. The former 0.4·r spheres gave 5 % ripple and a 46°
+  jump – a cogging bump 12× per wheel revolution. Small visual rollers are drawn instead; the collision
+  spheres are in geom group 3.
+* **Stiff, resolved contacts**: `roller_contact_timeconst_s` = 2 ms at `roller_timestep_s` = 1 ms. With the old
+  4 ms contact at 2 ms steps the rocking mode sat at ~15 Hz, under-resolved, and was visible on the IMU; a
+  controller with useful bandwidth then chattered the steppers into saturation and the head hopped off the
+  rollers. Control stays at `control_hz` (`frame_skip` follows the simulated step).
+* **Implicit stepper saturation** (see below).
+
+`roller_timestep_s = 0.0005` (≈2× slower again) gives the strictest check: with it the classical controller
+also survives bandwidths ≥ 5 rad/s and randomisation with pushes as on the virtual model; at the 1 ms default
+those cases can still fail.
 
 ### Stepper + TMC2208 model
 * Velocity servo (stiff "stepper-like" `kv`) with **pull-out torque curve**: 0.41 N·m holding × supply-voltage
@@ -199,6 +219,11 @@ validation rig measures the roller model's transmission ratio within ≈5 % of R
 * **Micro-step quantisation** of the commanded rate per control tick, **deadband**, **command latency**.
 * **Missed steps**: whenever the servo saturates on the stepper limit, the lost micro-steps are accumulated
   (`info["missed_steps"]`) — the encoders then disagree with open-loop step counting, as on hardware.
+* Roller model: the wheel's own inertia (~2·10⁻⁵ kg·m²) is tiny, so a *clamped* servo force (applied
+  explicitly) would overshoot the command by τ·dt/I ≈ 20–40 rad/s in one physics step. Saturation is therefore
+  modelled as a reduced servo stiffness k<sub>v,eff</sub> = min(k<sub>v</sub>, τ<sub>limit</sub>/|ω<sub>cmd</sub> − ω|): the torque still equals the
+  pull-out limit, but stays implicit and cannot overshoot (a stepper cannot outrun its step train). The
+  validation rig uses the same model.
 * Traction note: at θ = 31° with a 2.2 kg head the normal load per wheel is N = m g / (3 cos θ) ≈ 8.4 N, so
   with μ ≈ 0.9 the **transmissible torque is ≈ 0.22 N·m — about half the 0.41 N·m holding torque**.
   At 40°, N ≈ 9.4 N (+12 %). Grip, not motor torque, is usually the limiting factor.
@@ -214,6 +239,24 @@ High-tessellation icosphere (`ball_mesh_subdivisions`, 642 vertices at level 3) 
 stretch (non-sphericity) and Gaussian dents/bumps. MuJoCo collides meshes via their **convex hull**:
 outward bumps act fully, inward dents become *flat spots* bridging the dent — which is precisely how a hard
 dented shell rolls on flat ground. CoM offset is applied to the ball inertial frame.
+
+### Classical balance controller (`classical_controller.py`)
+A model-based baseline that uses only the hardware sensors (IMU roll/pitch/gyro + wheel encoders). Per
+horizontal head-frame axis the velocity-commanded plant is θ̈ = a θ + b u̇ (θ head tilt, u head-relative-to-ball
+rate imposed by the wheels, a = m<sub>h</sub> g l / M, b = (M<sub>11</sub> + M<sub>12</sub>) / M from the head + ball Lagrangian). The
+state [ball angle φ, θ, θ̇, u] is pole-placed with all poles at −`bandwidth` (ball position at
+−`pos_pole_frac`·`bandwidth`) and u is mapped to the wheels with the exact Jacobian.
+
+```python
+from classical_controller import controller_from_config, ControllerParams
+env = BB8BalanceEnv(cfg, training=False)            # info["obs_full"] = unscaled full observation
+ctrl = controller_from_config(cfg)                  # ControllerParams(bandwidth=4.0, ...)
+obs, info = env.reset(seed=0); ctrl.reset()
+obs, r, term, trunc, info = env.step(ctrl(info["obs_full"]))
+```
+
+With nominal physics it balances indefinitely on both omniwheel models (max tilt = initial tilt); on the
+virtual model also with full randomisation and pushes.
 
 ### Fall / contact-loss detection
 Tilt > threshold, **or** (virtual model) the ball-joint reaction force would have to *pull the head down*
@@ -521,7 +564,9 @@ python tests/test_smoke.py
 ```
 
 Covers: distribution sampling & config round-trip; both omniwheel models with heightfield, dents, pushes and
-targets; the validation rig transmission ratio; cold-start ONNX → onnxruntime → reload → generated C++
+targets; the validation rig transmission ratio (within 5 % of R/r) and roller envelope ripple; the classical
+controller balancing on the virtual model and for 15 s on the roller model (max tilt < 5°, no wheel
+spin-ups or stepper saturation); cold-start ONNX → onnxruntime → reload → generated C++
 compiled with `g++ -Wall -Werror` and compared numerically; experiment ZIP; a short PPO run through the
 real multiprocess `TrainingController` (episodes, frames, checkpoints, best-model ONNX).
 
@@ -544,7 +589,9 @@ mode and ESC factory reset.
 * **Parallel grid** is a multi-viewport grid (one small renderer per agent) rather than an 8-arena single
   scene, so each agent keeps its own randomised geometry.
 * **Omniwheels**: stock MuJoCo cannot orient anisotropic contact friction, hence the Jacobian ("virtual")
-  model for RL and the multi-roller model for fidelity checks. The roller model shows a ±5 % transmission ripple.
+  model for RL and the multi-roller model for fidelity checks. The roller model shows a ≈1 % envelope ripple
+  (±5 % instantaneous transmission ratio), needs a 1 ms physics step and runs ≈3× slower; its margins are
+  smaller than the virtual model's at the default step (see *Roller model settings*).
 * **Dents** act through the convex hull (flat spots), not as concave pockets.
 * **Odometry** (target observation on hardware) assumes no slip; while wheels slip it over-estimates
   distance — retrain with targets disabled for pure balancing if you do not need waypoints.
@@ -554,6 +601,6 @@ mode and ESC factory reset.
   `stepper_max_speed_rads` (~1.7 m/s ball speed), after which the head falls. Expect to need longer runs
   (several million steps, Headless Turbo, all cores) and reward/curriculum tuning (e.g. start with
   *Off (Ideal Nominal Physics)*, raise `ball_velocity`/`drift` weights) to get a policy fit for hardware.
-  A hand-tuned PD velocity controller balances the same model indefinitely, so the plant is controllable.
+  The classical controller (`classical_controller.py`) balances the same model indefinitely, so the plant is controllable.
 * Policies are geometry-specific: retrain (or fine-tune from the session) after changing zenith angle,
   wheel size or ball radius.

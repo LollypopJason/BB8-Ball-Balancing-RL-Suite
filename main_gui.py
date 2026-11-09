@@ -933,6 +933,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addRow("Wheel diameter", self._bind(rc, "wheel_diameter_m", fspin(rc.wheel_diameter_m, 0.02, 0.2, 0.001, 4, "m"), "rebuild"))
         f.addRow("Wheel width", self._bind(rc, "wheel_width_m", fspin(rc.wheel_width_m, 0.005, 0.08, 0.001, 4, "m"), "rebuild"))
         f.addRow("Rollers per row", self._bind(rc, "rollers_per_row", ispin(rc.rollers_per_row, 3, 16), "rebuild"))
+        f.addRow("Roller radius / wheel radius", self._bind(rc, "roller_radius_frac", fspin(rc.roller_radius_frac, 0.2, 0.95, 0.05, 2), "rebuild"))
         om = QtWidgets.QComboBox()
         om.addItem("Virtual (Jacobian, fast RL)", "virtual")
         om.addItem("Multi-roller contact (high fidelity)", "roller")
@@ -958,6 +959,7 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addRow("Max speed", self._bind(rc, "stepper_max_speed_rads", fspin(rc.stepper_max_speed_rads, 1, 300, 1, 1, "rad/s"), "rebuild"))
         f.addRow("Torque left at max speed", self._bind(rc, "stepper_torque_at_max_frac", fspin(rc.stepper_torque_at_max_frac, 0.05, 1, 0.05, 2), "reset"))
         f.addRow("Physics timestep", self._bind(rc, "physics_timestep_s", fspin(rc.physics_timestep_s, 0.0002, 0.01, 0.0005, 4, "s"), "rebuild"))
+        f.addRow("Physics timestep (roller / rig)", self._bind(rc, "roller_timestep_s", fspin(rc.roller_timestep_s, 0.0002, 0.005, 0.00025, 5, "s"), "rebuild"))
         f.addRow("Control rate", self._bind(rc, "control_hz", fspin(rc.control_hz, 10, 1000, 10, 0, "Hz"), "rebuild"))
         v.addWidget(g)
         g = QtWidgets.QGroupBox("Validation rig")
@@ -1480,7 +1482,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 else:
                     self.toggle_sim()
         elif isinstance(s, ValidationRigSim):
-            t = s.step(self.rig_cmd, self.cfg.robot.frame_skip * self.cfg.robot.physics_timestep_s)
+            t = s.step(self.rig_cmd, self.cfg.robot.control_dt_s)
             vals = {k: float(v) for k, v in t.items() if k != "time"}
             self.recorder.add(t["time"], s.data.qpos, s.data.mocap_pos, vals)
             self.viewport.overlay = (f"cmd {t['cmd_rads']:.1f} rad/s | enc {t['enc_vel_rads']:.2f} | torque "
@@ -1498,7 +1500,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_tick = now
         mode = self.cfg.viewer.mode
         if self.sim_running and not self.scrubbing and self.sim is not None and mode != "headless":
-            ctrl_dt = self.cfg.robot.frame_skip * self.cfg.robot.physics_timestep_s
+            ctrl_dt = self.cfg.robot.control_dt_s
             self._acc += dt * self.speed
             n = 0
             while self._acc >= ctrl_dt and n < 40:

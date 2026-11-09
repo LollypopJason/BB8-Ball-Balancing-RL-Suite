@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config_and_distributions import DP, AppConfig, default_config, create_experiment_bundle  # noqa: E402
 from bb8_gym_env import BB8BalanceEnv, ValidationRigSim  # noqa: E402
+from classical_controller import controller_from_config  # noqa: E402
+from mjcf_generator import omniwheel_envelope  # noqa: E402
 from rl_onnx_cpp_engine import (PolicyRunner, build_cold_start_snapshot, ensure_initial_policy,  # noqa: E402
                                 export_onnx, generate_cpp, load_onnx_snapshot, TrainingController)
 
@@ -56,9 +58,60 @@ def test_env_modes_and_terrain():
 
 def test_validation_rig():
     rig = ValidationRigSim()
-    for _ in range(100):
-        t = rig.step(10.0, 0.01)
-    assert abs(t["slip_ratio"]) < 0.25, t
+    rc = rig.cfg.robot
+    for cmd in (3.0, 10.0):
+        rig.reset()
+        ratios = []
+        for k in range(150):
+            t = rig.step(cmd, 0.01)
+            if k >= 50:   # after spin-up
+                ratios.append(-t["enc_vel_rads"] / t["ball_speed_meas_rads"])
+        assert abs(t["slip_ratio"]) < 0.25, t
+        # roller transmission ratio (wheel speed / sphere speed) stays within 5 % of R / r
+        ratio = float(np.mean(ratios)) * rc.wheel_radius_m / rc.ball_radius_m
+        assert abs(ratio - 1.0) < 0.05, (cmd, ratio)
+
+
+def test_roller_envelope():
+    rc = default_config().robot
+    env_r = omniwheel_envelope(rc, rc.wheel_radius_m)
+    ripple = 1.0 - env_r.min() / rc.wheel_radius_m
+    assert abs(env_r.max() - rc.wheel_radius_m) < 1e-9 and ripple < 0.015, ripple
+
+
+def _balance(omni: str, seconds: float, **cfg_kw):
+    c = default_config()
+    c.robot.omniwheel_model = omni
+    c.terrain.off_ideal_nominal = True     # nominal physics
+    c.episode.max_episode_s = seconds + 1.0
+    for k, v in cfg_kw.items():
+        setattr(c.robot, k, v)
+    env = BB8BalanceEnv(c, seed=0, training=False)
+    ctrl = controller_from_config(c)
+    _, info = env.reset(seed=0)
+    ctrl.reset()
+    max_tilt, max_wheel = 0.0, 0.0
+    for _ in range(int(round(seconds / env.dt_ctrl))):
+        _, _, term, trunc, info = env.step(ctrl(info["obs_full"]))
+        max_tilt = max(max_tilt, info["tilt_deg"])
+        max_wheel = max(max_wheel, float(np.abs(info["enc_vel"]).max()))
+        assert not (term or info["fallen"]), (omni, info["time"], max_tilt)
+    env.close()
+    return max_tilt, max_wheel, float(info["missed_steps"].sum())
+
+
+def test_classical_controller_virtual():
+    max_tilt, _, missed = _balance("virtual", 5.0)
+    assert max_tilt < 5.0 and missed == 0, (max_tilt, missed)
+
+
+def test_classical_controller_roller():
+    """High-fidelity roller model: the classical controller must balance like on the virtual model
+    (no wheel spin-ups / stepper saturation from roller chatter or the head hopping off the rollers)."""
+    max_tilt, max_wheel, missed = _balance("roller", 15.0)
+    assert max_tilt < 5.0, max_tilt
+    assert max_wheel < 8.0, max_wheel          # ~2-3 rad/s needed; the old model spiked to 20-45 rad/s
+    assert missed < 1000, missed               # micro-steps over 15 s (old model: >10 000 within 2 s)
 
 
 def test_onnx_and_cpp_roundtrip():

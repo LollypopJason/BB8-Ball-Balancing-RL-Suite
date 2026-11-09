@@ -39,6 +39,7 @@ from gymnasium import spaces
 from config_and_distributions import (ALL_OBS_CHANNELS, ALL_OBS_SCALES, GRAVITY, AppConfig,
                                       active_action_indices, active_obs_indices, default_config)
 from mjcf_generator import (StructuralSample, build_xml, generate_validation_rig_xml, omniwheel_frames)
+from plugins import load_plugins
 
 
 def quat_to_rpy(q: np.ndarray) -> Tuple[float, float, float]:
@@ -71,6 +72,8 @@ class BB8BalanceEnv(gym.Env):
         self.training = training
         self._rng = np.random.default_rng(seed)
         self.model_version = 0
+        self.difficulty = 1.0     # curriculum: 0 = nominal physics / no pushes, 1 = full randomisation
+        self.plugins = load_plugins(self.cfg)
         self._structural_key = None
         self.model: Optional[mujoco.MjModel] = None
         self.data: Optional[mujoco.MjData] = None
@@ -104,10 +107,10 @@ class BB8BalanceEnv(gym.Env):
 
     def _sample_structural(self, ideal: bool) -> StructuralSample:
         rc, br, wr = self.cfg.robot, self.cfg.randomization.ball, self.cfg.randomization.wheels
-        radii = [rc.wheel_radius_m * (1.0 + d.draw(self._rng, ideal)) for d in wr.diameter_offset_frac]
+        radii = [rc.wheel_radius_m * (1.0 + self._draw(d, ideal)) for d in wr.diameter_offset_frac]
         return StructuralSample(ball_radius=rc.ball_radius_m,
-                                non_sphericity=br.non_sphericity.draw(self._rng, ideal),
-                                dent_depth=br.dent_depth_m.draw(self._rng, ideal),
+                                non_sphericity=self._draw(br.non_sphericity, ideal),
+                                dent_depth=self._draw(br.dent_depth_m, ideal),
                                 wheel_radii=radii, mesh_seed=int(self._rng.integers(1 << 30)))
 
     def _build(self, s: StructuralSample) -> None:
@@ -162,6 +165,10 @@ class BB8BalanceEnv(gym.Env):
             jb = nid(mujoco.mjtObj.mjOBJ_JOINT, "head_ball_joint")
             self.hb_qadr, self.hb_dadr = m.jnt_qposadr[jb], m.jnt_dofadr[jb]
         self.hfield_id = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_HFIELD, "rough_hf")
+        self.ext_force = np.zeros((m.nbody, 6))
+        self._ext_active = False
+        self._ext_cleared = True
+        self._manual_push_bid = None
         # nominal values that randomisation scales
         self.nom_head_ipos = m.body_ipos[self.head_bid].copy()
         self.nom_head_inertia = m.body_inertia[self.head_bid].copy()
@@ -175,7 +182,7 @@ class BB8BalanceEnv(gym.Env):
     # --------------------------------------------------------- randomisation
     def _sample_params(self, ideal: bool) -> None:
         r, rng = self.cfg.randomization, self._rng
-        d = lambda dp: dp.draw(rng, ideal)
+        d = lambda dp: self._draw(dp, ideal)
         p = {
             "ball_mass": d(r.ball.mass_kg), "ball_slide": d(r.ball.sliding_grip),
             "ball_torsion": d(r.ball.torsional_friction), "ball_roll": d(r.ball.rolling_resistance),
@@ -194,7 +201,7 @@ class BB8BalanceEnv(gym.Env):
         com_dir = rng.normal(size=3)
         p["ball_com_vec"] = p["ball_com_off"] * com_dir / (np.linalg.norm(com_dir) + 1e-9)
         for g in self.ground_gids:
-            p["tile_grip"][g] = (self.cfg.terrain.tile_grip_factor.draw(rng, ideal)
+            p["tile_grip"][g] = (self._draw(self.cfg.terrain.tile_grip_factor, ideal)
                                  if (self.cfg.terrain.variable_grip or self.cfg.terrain.rough_heightfield) else 1.0)
         self.p = p
 
@@ -373,11 +380,24 @@ class BB8BalanceEnv(gym.Env):
             d.time = 0.0
             mujoco.mj_forward(m, d)
         self._schedule_push(first=True)
+        self.plugins.run_reset(self)
         self.prev_dist = self._target_dist()
         obs_full = self._observe()
         return self._mask_obs(obs_full), self._info(obs_full, 0.0)
 
     # ---------------------------------------------------------------- API
+    def _draw(self, dp, ideal: bool) -> float:
+        """Sample a DistributionParameter, shrunk toward its nominal value by the curriculum difficulty."""
+        x = dp.draw(self._rng, ideal)
+        if ideal or self.difficulty >= 1.0:
+            return x
+        nom = dp.nominal()
+        return nom + max(0.0, self.difficulty) * (x - nom)
+
+    def set_difficulty(self, d: float) -> None:
+        """Curriculum hook (applied from the next reset; pushes scale immediately)."""
+        self.difficulty = float(min(1.0, max(0.0, d)))
+
     def set_target(self, x: float, y: float, enabled: bool = True) -> None:
         """Change the waypoint live (mid-episode)."""
         self.target = np.array([float(x), float(y)])
@@ -389,6 +409,7 @@ class BB8BalanceEnv(gym.Env):
     def update_config(self, cfg: AppConfig) -> None:
         """Apply a new configuration; takes effect (incl. recompilation) on next reset."""
         self.cfg = cfg.copy()
+        self.plugins = load_plugins(self.cfg)
         self._structural_key = None
         self.dt_ctrl = self.cfg.robot.frame_skip * self.cfg.robot.physics_timestep_s
         self.max_steps = int(round(self.cfg.episode.max_episode_s / self.dt_ctrl))
@@ -414,27 +435,38 @@ class BB8BalanceEnv(gym.Env):
     def _update_push(self) -> None:
         dc, d = self.cfg.disturbance, self.data
         bid = self.head_bid if dc.target_body == "head" else self.ball_bid
+        if self._manual_push_bid is not None:
+            bid = self._manual_push_bid
         if d.time >= self.push_next_t:
-            mag = dc.magnitude_n.sample(self._rng)
+            self._manual_push_bid = None
+            bid = self.head_bid if dc.target_body == "head" else self.ball_bid
+            mag = dc.magnitude_n.sample(self._rng) * self.difficulty
             az = math.radians(dc.azimuth_deg.sample(self._rng))
             el = math.radians(dc.elevation_deg.sample(self._rng))
             self.push_force = mag * np.array([math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)])
             self.push_end_t = d.time + dc.duration_s.sample(self._rng)
             self._schedule_push()
+        d.xfrc_applied[:] = self.ext_force          # plugin / external forces (persist per control step)
+        self._ext_cleared = False
         if d.time < self.push_end_t:
-            d.xfrc_applied[bid, :3] = self.push_force
-        elif self.push_end_t > 0:
-            d.xfrc_applied[bid, :3] = 0.0
-            if d.time > self.push_end_t + 0.5:
-                self.push_force = np.zeros(3)
-                self.push_end_t = -1.0
+            d.xfrc_applied[bid, :3] += self.push_force
+        elif self.push_end_t > 0 and d.time > self.push_end_t + 0.5:
+            self.push_force = np.zeros(3)
+            self.push_end_t = -1.0
+
+    def add_external_force(self, body, force=(0, 0, 0), torque=(0, 0, 0)) -> None:
+        """For plugins: add a world-frame force [N] / torque [N*m] on a body (name or id) for the
+        current control step. Cleared automatically before the next ``on_step`` call."""
+        bid = body if isinstance(body, (int, np.integer)) else mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body)
+        self.ext_force[bid, :3] += np.asarray(force, float)
+        self.ext_force[bid, 3:] += np.asarray(torque, float)
+        self._ext_active = True
 
     def apply_push(self, force_xyz, duration: float = 0.1, body: str = "head") -> None:
         """Manual push from the GUI."""
         self.push_force = np.asarray(force_xyz, float)
         self.push_end_t = self.data.time + duration
-        bid = self.head_bid if body == "head" else self.ball_bid
-        self.data.xfrc_applied[bid, :3] = self.push_force
+        self._manual_push_bid = self.head_bid if body == "head" else self.ball_bid
 
     # -------------------------------------------------------------- step
     def step(self, action):
@@ -458,7 +490,11 @@ class BB8BalanceEnv(gym.Env):
             spr = rc.steps_per_rad
             cmd = np.round(cmd * spr * self.dt_ctrl) / (spr * self.dt_ctrl)  # integer micro-steps per tick
         self.motor_cmd = cmd
-
+        if self._ext_active:
+            self.ext_force[:] = 0.0
+            self._ext_active = False
+        if self.plugins.steps:
+            self.plugins.run_step(self)
         self._integrate(cmd)
         self.step_count += 1
         self.sim_time = d.time
@@ -509,8 +545,11 @@ class BB8BalanceEnv(gym.Env):
             fr[:, 0] = -limit
             fr[:, 1] = limit
             d.ctrl[:] = np.minimum(np.maximum(cmd, -limit), limit) if torque_mode else cmd
-            if self.push_next_t != math.inf or self.push_end_t > 0:
+            if self.push_next_t != math.inf or self.push_end_t > 0 or self._ext_active:
                 self._update_push()
+            elif self._ext_cleared is False:
+                d.xfrc_applied[:] = 0.0
+                self._ext_cleared = True
             mujoco.mj_step(m, d)
             ws = self._wheel_speeds()
             force = d.actuator_force
@@ -583,9 +622,13 @@ class BB8BalanceEnv(gym.Env):
         acc = acc + self.imu_bias[6:9] + rng.normal(0, ip["accel_noise_std_ms2"], 3)
         enc_v = self.enc_vel + rng.normal(0, ip["encoder_noise_std_rads"], 3)
         enc_p = wrap_pi(self.enc_pos)
-        # target error in the (IMU-yaw) heading frame
-        if self.target_enabled:
-            e = self.target - self.ball_pos()[:2]
+        # target error in the (IMU-yaw) heading frame; without a waypoint it points back to the spawn
+        # point (= odometry origin on the real robot) so the policy can observe and hold its position
+        home = self.target if self.target_enabled else (
+            np.array([self.cfg.episode.spawn_x_m, self.cfg.episode.spawn_y_m]) if self.cfg.episode.hold_spawn_position
+            else None)
+        if home is not None:
+            e = home - self.ball_pos()[:2]
             n = np.linalg.norm(e)
             clip = self.cfg.episode.target_obs_clip_m
             if n > clip:
@@ -612,9 +655,12 @@ class BB8BalanceEnv(gym.Env):
             "action": -w.action * float(a @ a),
             "action_rate": -w.action_rate * float((a - self.prev_action) @ (a - self.prev_action)),
         }
+        if self.plugins.rewards:
+            t.update(self.plugins.reward_terms(self))
         pos = self.ball_pos()[:2]
         v = self.data.qvel[self.ball_dadr:self.ball_dadr + 2]
-        t["ball_velocity"] = -w.ball_velocity * float(v @ v) * (0.2 if self.target_enabled else 1.0)
+        # linear in speed: cruising slowly must not be "almost free" (|v| instead of v^2)
+        t["ball_velocity"] = -w.ball_velocity * float(np.linalg.norm(v)) * (0.2 if self.target_enabled else 1.0)
         if self.target_enabled:
             dist = self._target_dist()
             t["target_distance"] = -w.target_distance * min(dist, 3.0)
@@ -625,7 +671,7 @@ class BB8BalanceEnv(gym.Env):
             self.prev_dist = dist
         else:
             spawn = np.array([self.cfg.episode.spawn_x_m, self.cfg.episode.spawn_y_m])
-            t["drift"] = -w.drift * min(float(np.linalg.norm(pos - spawn)), 3.0)
+            t["drift"] = -w.drift * min(float(np.linalg.norm(pos - spawn)), 5.0)
         return float(sum(t.values())), t
 
     def _info(self, obs_full: np.ndarray, reward: float, terms: Optional[dict] = None) -> Dict[str, Any]:

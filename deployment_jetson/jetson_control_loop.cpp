@@ -60,6 +60,8 @@ class FlatJson {
   }
   double num(const std::string& k, double def = 0) const {
     size_t p = find(k); if (p == std::string::npos) return def;
+    if (txt_.compare(p, 4, "true") == 0) return 1.0;     // JSON booleans
+    if (txt_.compare(p, 5, "false") == 0) return 0.0;
     return std::strtod(txt_.c_str() + p, nullptr);
   }
   std::string str(const std::string& k, const std::string& def = "") const {
@@ -278,7 +280,8 @@ int main(int argc, char** argv) {
   const double cutoff = cfg.num("tilt_cutoff_deg", 35) * M_PI / 180.0;
   const double deadband = cfg.num("deadband_rads", 0), alpha = cfg.num("encoder_velocity_lpf_alpha", 0.5);
   const bool target_on = cfg.num("target_enabled", 0) != 0;
-  const double tx = cfg.num("target_x_m"), ty = cfg.num("target_y_m");
+  const bool hold_start = cfg.num("hold_start_position", 1) != 0;   // no waypoint -> hold the odometry origin
+  const double tx = target_on ? cfg.num("target_x_m") : 0.0, ty = target_on ? cfg.num("target_y_m") : 0.0;
   const auto msign = cfg.nums("motor_direction_sign");
 
   I2CBus bus((int)cfg.num("i2c_bus", 1));
@@ -349,7 +352,7 @@ int main(int argc, char** argv) {
     first = false;
     odo.update(enc_vel, imu.gyro, imu.rpy[2], dt);
     float tdx = 0, tdy = 0;
-    if (target_on) {
+    if (target_on || hold_start) {
       double ex = tx - odo.x, ey = ty - odo.y, n = std::hypot(ex, ey);
       if (n > 2.0) { ex *= 2.0 / n; ey *= 2.0 / n; }
       double c = cos(imu.rpy[2]), s = sin(imu.rpy[2]);

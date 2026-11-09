@@ -10,6 +10,9 @@ onnxruntime>=1.17      # 1.29.0
 PySide6>=6.6           # 6.12.0
 pyqtgraph>=0.13.7      # 0.14.0
 psutil>=5.9            # 7.2.2
+imageio>=2.31          # 2.38.1  episode video export
+imageio-ffmpeg>=0.4.9  # bundled ffmpeg binary for MP4
+Pillow>=10             # 12.3.0  GIF fallback
 
 # Jetson Nano runtime (install ON the Jetson, see README section 9):
 #   numpy smbus2 pyserial onnxruntime(-gpu JetPack wheel) onnx

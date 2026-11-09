@@ -443,6 +443,12 @@ def generate_bb8_xml(cfg: AppConfig, structural: Optional[StructuralSample] = No
     t_asset, t_body, t_info = terrain_xml(cfg.terrain)
     if t_asset:
         assets.append(t_asset)
+    from plugins import load_plugins  # local import: plugins may import this module
+    p_asset, p_body = load_plugins(cfg).scene_fragments(cfg)
+    if p_asset:
+        assets.append(p_asset)
+    if p_body:
+        t_body = t_body + "\n    " + p_body
 
     m_head = rc.head_mass_kg
     hub_mass, roller_mass = 0.035, 0.002

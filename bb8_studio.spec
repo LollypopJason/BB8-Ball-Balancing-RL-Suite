@@ -15,7 +15,7 @@ NAME = "BB8_RL_Studio"
 
 datas, binaries, hiddenimports = [], [], []
 # packages with native plugins / data files that static analysis misses
-for pkg in ("mujoco", "glfw", "onnxruntime", "stable_baselines3"):
+for pkg in ("mujoco", "glfw", "onnxruntime", "stable_baselines3", "imageio_ffmpeg"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -31,9 +31,12 @@ hiddenimports += collect_submodules("OpenGL", filter=lambda m: m.startswith(("Op
                                                                              "OpenGL.arrays", "OpenGL.GL")))
 hiddenimports += collect_submodules("onnx", filter=lambda m: not m.startswith(("onnx.backend.test", "onnx.reference")))
 hiddenimports += ["config_and_distributions", "mjcf_generator", "bb8_gym_env", "rl_onnx_cpp_engine",
+                  "classical_controller", "deployment_package", "gui_addons", "plugins", "verification_examples",
+                  "imageio", "imageio.v2", "imageio.plugins.ffmpeg", "imageio.plugins.pillow", "PIL",
                   "psutil", "stable_baselines3.ppo", "stable_baselines3.sac",
                   "stable_baselines3.common.vec_env.subproc_vec_env"]
-datas += [("deployment_jetson", "deployment_jetson"), ("README.md", "."), ("requirements.txt", ".")]
+datas += [("deployment_jetson", "deployment_jetson"), ("plugins", "plugins"), ("classical_controller.py", "."),
+          ("README.md", "."), ("VERIFICATION.md", "."), ("requirements.txt", ".")]
 
 a = Analysis(
     ["main_gui.py"],

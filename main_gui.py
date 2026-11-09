@@ -54,6 +54,12 @@ from config_and_distributions import (APP_NAME, APP_VERSION, DIST_MODES, OBS_GRO
                                       default_config, ensure_workspace, make_stylesheet, timestamp)
 from bb8_gym_env import BB8BalanceEnv, ValidationRigSim, quat_to_rpy, wrap_pi
 from mjcf_generator import import_custom_model, list_model_tree
+from classical_controller import controller_from_config
+from deployment_package import build_jetson_package
+from gui_addons import (CAMERA_PRESETS, QUICK_START, ROW_TOOLTIPS, SHORTCUTS, Overlays, PluginManagerDialog,
+                        VerificationDialog, apply_camera_preset, export_timeline_video, render_offscreen, save_png,
+                        tooltip_for)
+from plugins import load_plugins
 from rl_onnx_cpp_engine import (PolicyRunner, PolicySnapshot, TrainingController, allowed_cores,
                                 ensure_initial_policy, export_onnx, generate_cpp, load_onnx_snapshot,
                                 load_session, process_tree_rss_mb, save_session)
@@ -91,6 +97,7 @@ class MjViewport(QtWidgets.QWidget):
         self.error: Optional[str] = None
         self.enabled = True
         self.hfield_upload: Optional[int] = None
+        self.overlay_fn: Optional[Callable] = None      # extra scene geoms (gui_addons.Overlays)
         self._press = None
         self._btn = None
 
@@ -151,6 +158,11 @@ class MjViewport(QtWidgets.QWidget):
                     if g.objtype == mujoco.mjtObj.mjOBJ_GEOM and g.objid in self.highlight_geoms:
                         g.rgba[:] = (1.0, 0.15, 0.85, 1.0)
                         g.emission = 0.9
+            if self.overlay_fn is not None:
+                try:
+                    self.overlay_fn(r.scene)
+                except Exception:
+                    pass
             if self.hfield_upload is not None:
                 try:
                     r._gl_context.make_current()
@@ -445,7 +457,8 @@ class TelemetryPanel(QtWidgets.QWidget):
 
 class TrainingPlots(QtWidgets.QWidget):
     KEYS = [("return", "Episode return"), ("survival_s", "Survival time [s]"),
-            ("mean_tilt_deg", "Mean tilt [deg]"), ("final_target_dist", "Waypoint distance [m]")]
+            ("mean_tilt_deg", "Mean tilt [deg]"), ("final_target_dist", "Waypoint distance [m]"),
+            ("difficulty", "Curriculum difficulty (0 = nominal physics, 1 = full randomisation)")]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -456,6 +469,8 @@ class TrainingPlots(QtWidgets.QWidget):
         self.data: Dict[str, List[float]] = {k: [] for k, _ in self.KEYS}
         self.steps: List[int] = []
         self.items = {}
+        self.plots = []
+        self.markers = []
         prev = None
         for r, (k, title) in enumerate(self.KEYS):
             p = self.glw.addPlot(row=r, col=0)
@@ -467,7 +482,18 @@ class TrainingPlots(QtWidgets.QWidget):
             sc = p.plot([], [], pen=None, symbol="o", symbolSize=3, symbolBrush=(47, 164, 255, 90), symbolPen=None)
             ma = p.plot([], [], pen=pg.mkPen("#ff8a1f", width=2))
             self.items[k] = (sc, ma)
+            self.plots.append(p)
         self._dirty = False
+
+    def add_marker(self, timesteps: int, difficulty: float):
+        """Vertical line on every plot where the curriculum raised the difficulty."""
+        for p in self.plots:
+            ln = pg.InfiniteLine(pos=timesteps, angle=90, movable=False,
+                                 pen=pg.mkPen("#b07cff", width=1, style=Qt.DashLine),
+                                 label=f"d={difficulty:.2f}" if p is self.plots[0] else None,
+                                 labelOpts={"position": 0.9, "color": "#b07cff"})
+            p.addItem(ln)
+            self.markers.append((p, ln))
 
     def add(self, msg: dict):
         self.steps.append(msg.get("timesteps", 0))
@@ -493,6 +519,9 @@ class TrainingPlots(QtWidgets.QWidget):
     def clear(self):
         self.steps = []
         self.data = {k: [] for k, _ in self.KEYS}
+        for p, ln in self.markers:
+            p.removeItem(ln)
+        self.markers = []
         for sc, ma in self.items.values():
             sc.setData([], [])
             ma.setData([], [])
@@ -514,9 +543,10 @@ class TrainingPlots(QtWidgets.QWidget):
 class DistributionWidget(QtWidgets.QWidget):
     changed = Signal()
 
-    def __init__(self, dp: DistributionParameter, decimals: int = 4, parent=None):
+    def __init__(self, dp: DistributionParameter, decimals: int = 4, parent=None, help_text: str = ""):
         super().__init__(parent)
         self.dp = dp
+        self.help_text = help_text
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(3)
@@ -569,7 +599,8 @@ class DistributionWidget(QtWidgets.QWidget):
             self.a.setValue(self.dp.value)
             self.b.setVisible(False)
         tip = f"{self.dp.describe()}  (clamped to [{self.dp.clamp_low:g}, {self.dp.clamp_high:g}])"
-        self.setToolTip(tip)
+        self.setToolTip((self.help_text + "\n\n" if self.help_text else "") + "Current: " + tip +
+                        "\nConstant / Uniform(min, max) / Normal(mean, std) - re-sampled at every episode reset.")
         self.a.blockSignals(False)
         self.b.blockSignals(False)
 
@@ -596,7 +627,7 @@ class DistributionWidget(QtWidgets.QWidget):
             self.dp.mean, self.dp.std = self.a.value(), max(0.0, self.b.value())
         else:
             self.dp.value = self.a.value()
-        self.setToolTip(self.dp.describe())
+        self.setToolTip((self.help_text + "\n\n" if self.help_text else "") + "Current: " + self.dp.describe())
         self.changed.emit()
 
 
@@ -718,11 +749,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fps_frames, self._fps_t, self.fps = 0, time.perf_counter(), 0.0
         self._rebuild_timer = QTimer(self, singleShot=True, interval=250, timeout=self.rebuild_sim)
 
+        self.settings = QtCore.QSettings("BB8RLSuite", "Studio")
+        self.overlays = Overlays()
+        self._plugin_tabs: List[QtWidgets.QWidget] = []
         ensure_initial_policy(self.cfg)    # cold-start ONNX on startup
         self._build_ui()
+        self._build_menus()
+        self.viewport.overlay_fn = lambda scn: self.overlays.draw(
+            scn, self.viewport.model, self.viewport.data, self.sim if isinstance(self.sim, BB8BalanceEnv) else None)
         self.apply_theme(self.cfg.viewer.theme)
+        self._refresh_plugins(rebuild=False)
         self.rebuild_sim()
         self.set_mode(self.cfg.viewer.mode)
+        i = self.policy_combo.findData("classical")       # start with a robot that balances out of the box
+        self.policy_combo.setCurrentIndex(i)
+        self.set_policy("classical")
+        self._default_state = self.saveState()
+        if self.settings.value("geometry"):
+            self.restoreGeometry(self.settings.value("geometry"))
+            self.restoreState(self.settings.value("state") or self._default_state)
 
         self.timer = QTimer(self, interval=16, timeout=self._tick, timerType=Qt.PreciseTimer)
         self.timer.start()
@@ -733,6 +778,12 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_Escape), self, activated=self.emergency_reset,
                         context=Qt.ApplicationShortcut)
         QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_Space), self, activated=self.toggle_sim)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, activated=self.reset_episode)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+P"), self, activated=self.manual_push)
+        QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_F12), self, activated=self.screenshot)
+        for i, name in enumerate(CAMERA_PRESETS):
+            QtGui.QShortcut(QtGui.QKeySequence(f"Alt+{i + 1}"), self,
+                            activated=lambda n=name: apply_camera_preset(self.viewport, n))
         self.log(f"Workspace: {os.path.abspath(self.cfg.workspace_dir)}  (cold-start policy ready)")
 
     # ------------------------------------------------------------------ UI
@@ -759,6 +810,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # left dock: configuration
         self.left_dock = QtWidgets.QDockWidget("Configuration", self)
+        self.left_dock.setObjectName("ConfigDock")
         self.left_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable)
         self.left_dock.setMinimumWidth(430)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.left_dock)
@@ -766,6 +818,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # right dock: telemetry, training curves, log
         self.right_dock = QtWidgets.QDockWidget("Telemetry & Training", self)
+        self.right_dock.setObjectName("TelemetryDock")
         self.right_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable)
         self.right_dock.setMinimumWidth(430)
         tabs = QtWidgets.QTabWidget()
@@ -776,12 +829,279 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs.addTab(self.telemetry, "Live Telemetry")
         tabs.addTab(self.train_plots, "Training Progress")
         tabs.addTab(self.log_box, "Log")
+        self.right_tabs = tabs
         self.right_dock.setWidget(tabs)
         self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
         self.statusBar().showMessage("Ready")
 
+    # ------------------------------------------------------------- menus
+    def _build_menus(self):
+        mb = self.menuBar()
+        A = lambda text, fn, sc=None, tip="": self._action(text, fn, sc, tip)
+        m = mb.addMenu("&File")
+        m.addAction(A("&New (factory defaults)", self.new_config, "Ctrl+N"))
+        m.addAction(A("&Open configuration preset…", self.open_preset, "Ctrl+O"))
+        m.addAction(A("&Save configuration preset as…", self.save_preset, "Ctrl+S"))
+        self.recent_menu = m.addMenu("Recent presets")
+        self._update_recent_menu()
+        m.addSeparator()
+        m.addAction(A("Load training session…", self.load_session_dialog))
+        m.addAction(A("Save training session…", self.save_session_dialog))
+        m.addSeparator()
+        ex = m.addMenu("&Export")
+        for text, fn in (("Best policy (.onnx)", self.export_best_onnx), ("C++ policy (.cpp/.h)", self.export_cpp),
+                         ("Telemetry (.csv)", self.export_csv), ("Experiment bundle (.zip)", self.export_bundle),
+                         ("Jetson deployment package (.zip)", self.export_jetson_package),
+                         ("Episode video (.mp4 / .gif)", self.export_video), ("Screenshot (.png)", self.screenshot)):
+            ex.addAction(A(text, fn))
+        m.addSeparator()
+        m.addAction(A("&Quit", self.close, "Ctrl+Q"))
+        v = mb.addMenu("&View")
+        for key in ("single", "grid", "headless"):
+            v.addAction(self.mode_actions[key])
+        v.addSeparator()
+        v.addAction(A("Toggle dark / light theme", lambda: self.apply_theme(
+            "light" if self.cfg.viewer.theme == "dark" else "dark")))
+        cam = v.addMenu("Camera")
+        for i, name in enumerate(CAMERA_PRESETS):
+            cam.addAction(A(f"{name}\tAlt+{i + 1}", lambda n=name: apply_camera_preset(self.viewport, n)))
+        ov = v.addMenu("Overlays")
+        self.overlay_actions = {}
+        for key, text in (("push", "Push / wind force arrows"), ("trail", "Ball trail"),
+                          ("cog", "Centre-of-gravity markers"), ("velocity", "Ball velocity arrow"),
+                          ("target_line", "Line to waypoint"), ("contacts", "Contact points && forces")):
+            a = QtGui.QAction(text, self, checkable=True, checked=self.overlays.flags.get(key, False))
+            a.toggled.connect(lambda on, k=key: self._set_overlay(k, on))
+            ov.addAction(a)
+            self.overlay_actions[key] = a
+        v.addSeparator()
+        v.addAction(A("Reset window layout", lambda: self.restoreState(self._default_state)))
+        t = mb.addMenu("&Tools")
+        t.addAction(A("Real-world &verification examples…", self.open_verification, None,
+                      "Quick real-robot experiments with simulator predictions"))
+        t.addAction(A("&Plugin Manager…", self.open_plugin_manager))
+        self.plugin_menu = t.addMenu("Plugins")
+        t.addSeparator()
+        t.addAction(A("Open workspace folder", lambda: QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl.fromLocalFile(os.path.abspath(self.cfg.workspace_dir)))))
+        h = mb.addMenu("&Help")
+        h.addAction(A("&Quick start", lambda: self._html_dialog("Quick start", QUICK_START), "F1"))
+        h.addAction(A("&Keyboard && mouse shortcuts", self.show_shortcuts))
+        h.addAction(A("&About", lambda: QtWidgets.QMessageBox.about(
+            self, APP_NAME, f"<b>{APP_NAME}</b> v{APP_VERSION}<br>MuJoCo {mujoco.__version__} · "
+                            f"PySide6 · Stable-Baselines3 · ONNX<br>Settings are stored per user; "
+                            f"File → New restores factory defaults.")))
+
+    def _action(self, text, fn, shortcut=None, tip=""):
+        a = QtGui.QAction(text, self)
+        a.triggered.connect(lambda *_: fn())
+        if shortcut:
+            a.setShortcut(QtGui.QKeySequence(shortcut))
+        if tip:
+            a.setStatusTip(tip)
+        return a
+
+    def _set_overlay(self, key: str, on: bool):
+        self.overlays.flags[key] = on
+        if key == "contacts":
+            self.overlays.apply_option_flags(self.viewport.opt)
+        self.viewport.render_now()
+
+    def _html_dialog(self, title: str, html: str):
+        d = QtWidgets.QDialog(self)
+        d.setWindowTitle(title)
+        d.resize(720, 520)
+        lay = QtWidgets.QVBoxLayout(d)
+        tb = QtWidgets.QTextBrowser()
+        tb.setHtml(html)
+        tb.setOpenExternalLinks(True)
+        lay.addWidget(tb)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        bb.rejected.connect(d.reject)
+        lay.addWidget(bb)
+        d.exec()
+
+    def show_shortcuts(self):
+        rows = "".join(f"<tr><td><b>{k}</b></td><td>{v}</td></tr>" for k, v in SHORTCUTS)
+        self._html_dialog("Keyboard & mouse", f"<h3>Shortcuts</h3><table cellpadding=4>{rows}</table>")
+
+    # ------------------------------------------------- presets / settings
+    def _presets_dir(self) -> str:
+        d = os.path.join(os.path.abspath(self.cfg.workspace_dir), "presets")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def new_config(self):
+        r = QtWidgets.QMessageBox.question(self, "New configuration", "Restore all settings to factory defaults?")
+        if r != QtWidgets.QMessageBox.Yes:
+            return
+        self._replace_config(default_config(), "factory defaults")
+
+    def _replace_config(self, cfg: AppConfig, what: str):
+        theme, ws = self.cfg.viewer.theme, self.cfg.workspace_dir
+        self.cfg = cfg
+        self.cfg.viewer.theme, self.cfg.workspace_dir = theme, ws
+        self._rebuild_config_ui()
+        self._refresh_plugins(rebuild=False)
+        self.rebuild_sim()
+        self.log(f"Configuration loaded: {what}")
+
+    def save_preset(self):
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save configuration preset",
+                                                     os.path.join(self._presets_dir(), "my_robot.json"), "JSON (*.json)")
+        if p:
+            self.cfg.save(p)
+            self._add_recent(p)
+            self.log(f"Preset saved -> {p}")
+
+    def open_preset(self, path: Optional[str] = None):
+        p = path or QtWidgets.QFileDialog.getOpenFileName(self, "Open configuration preset", self._presets_dir(),
+                                                          "JSON (*.json)")[0]
+        if not p:
+            return
+        try:
+            cfg = AppConfig.load(p)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Preset error", f"{p}\n{e}")
+            return
+        self._add_recent(p)
+        self._replace_config(cfg, os.path.basename(p))
+
+    def _add_recent(self, p: str):
+        rec = [x for x in (self.settings.value("recent_presets") or []) if x != p]
+        self.settings.setValue("recent_presets", [p] + rec[:7])
+        self._update_recent_menu()
+
+    def _update_recent_menu(self):
+        self.recent_menu.clear()
+        rec = [x for x in (self.settings.value("recent_presets") or []) if os.path.isfile(x)]
+        for p in rec:
+            self.recent_menu.addAction(self._action(os.path.basename(p), lambda p=p: self.open_preset(p)))
+        self.recent_menu.setEnabled(bool(rec))
+
+    def config_applied_externally(self, msg: str):
+        """Called by dialogs (verification 'apply') after changing self.cfg."""
+        self._rebuild_config_ui()
+        self.rebuild_sim()
+        self.log("Configuration updated: " + msg.replace("\n", "; "))
+
+    # ------------------------------------------------------------ plugins
+    def _refresh_plugins(self, rebuild: bool = True):
+        reg = load_plugins(self.cfg, force=True)
+        for e in reg.errors:
+            self.log(e)
+        for w in self._plugin_tabs:
+            i = self.right_tabs.indexOf(w)
+            if i >= 0:
+                self.right_tabs.removeTab(i)
+            w.deleteLater()
+        self._plugin_tabs = []
+        for h in reg.panels:
+            try:
+                w = h.fn(self)
+                self.right_tabs.addTab(w, f"🧩 {h.name}")
+                self._plugin_tabs.append(w)
+            except Exception as e:
+                self.log(f"Plugin panel '{h.name}' failed: {e}")
+        self.plugin_menu.clear()
+        for h in reg.actions:
+            self.plugin_menu.addAction(self._action(h.name, lambda h=h: h.fn(self)))
+        self.plugin_menu.setEnabled(bool(reg.actions))
+        if hasattr(self, "policy_combo"):
+            for i in reversed(range(self.policy_combo.count())):
+                if str(self.policy_combo.itemData(i)).startswith("plugin:"):
+                    self.policy_combo.removeItem(i)
+            for name in reg.controllers:
+                self.policy_combo.insertItem(self.policy_combo.count() - 1, f"Plugin: {name}", f"plugin:{name}")
+        if reg.loaded:
+            self.log("Plugins loaded: " + ", ".join(p.get("name", p["file"]) for p in reg.loaded))
+        if rebuild:
+            self.rebuild_sim()
+
+    def open_plugin_manager(self):
+        d = PluginManagerDialog(self)
+        if d.exec() == QtWidgets.QDialog.Accepted:
+            self._refresh_plugins(rebuild=True)
+
+    def open_verification(self):
+        VerificationDialog(self).exec()
+
+    # ------------------------------------------------ screenshot / video
+    def screenshot(self):
+        if self.viewport.model is None:
+            return
+        out = os.path.join(os.path.abspath(self.cfg.workspace_dir), "exports", f"screenshot_{timestamp()}.png")
+        try:
+            img = render_offscreen(self.viewport.model, self.viewport.data, self.viewport.cam, 1920, 1080,
+                                   self.viewport.opt, self.viewport.overlay_fn)
+            save_png(img, out)
+            self.log(f"Screenshot -> {out}")
+            self.statusBar().showMessage(f"Screenshot saved: {out}", 6000)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Screenshot", f"Rendering failed: {e}")
+
+    def export_video(self):
+        if len(self.recorder) < 5 or self.viewport.model is None:
+            QtWidgets.QMessageBox.information(self, "Video", "Run the simulation first - the video is rendered from "
+                                                             "the recorded timeline (last "
+                                                             f"{self.cfg.viewer.record_seconds:.0f} s).")
+            return
+        p, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export episode video", os.path.join(os.path.abspath(self.cfg.workspace_dir), "exports",
+                                                       f"bb8_episode_{timestamp()}.mp4"), "MP4 video (*.mp4);;GIF (*.gif)")
+        if not p:
+            return
+        was_running = self.sim_running
+        if was_running:
+            self.toggle_sim()
+        frames = list(self.recorder.frames)
+        dlg = QtWidgets.QProgressDialog("Rendering video…", "Cancel", 0, 100, self)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+
+        def progress(k, n):
+            dlg.setMaximum(n)
+            dlg.setValue(k)
+            QtWidgets.QApplication.processEvents()
+            return not dlg.wasCanceled()
+        try:
+            out = export_timeline_video(self.viewport.model, frames, self.viewport.cam, p, fps=30, size=(1280, 720),
+                                        opt=self.viewport.opt, follow_body=self.viewport.follow_body,
+                                        progress=progress, overlay_flags=self.overlays.flags)
+            self.log(f"Video -> {out}")
+            QtWidgets.QMessageBox.information(self, "Video exported", out)
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Video", f"Export failed: {e}")
+        finally:
+            dlg.close()
+            if was_running:
+                self.toggle_sim()
+
+    def export_jetson_package(self):
+        ws = os.path.abspath(self.cfg.workspace_dir)
+        policy = None
+        for name in ("best_policy", "bc_policy"):
+            if os.path.isfile(os.path.join(ws, name + ".onnx")):
+                policy = os.path.join(ws, name + ".onnx")
+                break
+        out = QtWidgets.QFileDialog.getExistingDirectory(self, "Package output folder", os.path.join(ws, "exports"))
+        if not out:
+            return
+        try:
+            z = build_jetson_package(self.cfg, out, policy, os.path.splitext(policy)[0] + ".json" if policy else None)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Jetson package", f"{e}\n{traceback.format_exc()[-800:]}")
+            return
+        self.log(f"Jetson package -> {z}")
+        QtWidgets.QMessageBox.information(
+            self, "Jetson package exported",
+            f"{z}\n\nContains: generated robot_hw_config.json, "
+            f"{'RL policy ' + os.path.basename(policy) if policy else 'NO RL policy yet (train first)'}, classical "
+            f"controller, Arduino firmware, Python + C++ runners and DEPLOY.md with the exact commands.")
+
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
+        tb.setObjectName("MainToolbar")
         tb.setMovable(False)
         tb.addWidget(QtWidgets.QLabel(" Mode: "))
         self.mode_group = QtGui.QActionGroup(self)
@@ -812,6 +1132,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addAction(QtGui.QAction("➜ Push", self, triggered=self.manual_push, toolTip="Apply a random push to the head"))
         self.addToolBarBreak()
         tb = self.addToolBar("Resources")
+        tb.setObjectName("ResourcesToolbar")
         tb.setMovable(False)
         tb.addWidget(QtWidgets.QLabel(" Resource governor  CPU: "))
         self.cpu_combo = QtWidgets.QComboBox()
@@ -870,19 +1191,55 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------- configuration tabs
     def _build_config_tabs(self):
         self.cfg_tabs = QtWidgets.QTabWidget()
-        self.cfg_tabs.addTab(scroll(self._tab_robot()), "Robot")
-        self.cfg_tabs.addTab(scroll(self._tab_randomization()), "Randomization")
-        self.cfg_tabs.addTab(scroll(self._tab_terrain()), "Terrain && Pushes")
-        self.cfg_tabs.addTab(scroll(self._tab_episode()), "Episode && Target")
-        self.cfg_tabs.addTab(scroll(self._tab_training()), "Network && Training")
+        self.cfg_tabs.addTab(self._resettable(self._tab_robot(), ["robot"]), "Robot")
+        self.cfg_tabs.addTab(self._resettable(self._tab_randomization(), ["randomization"]), "Randomization")
+        self.cfg_tabs.addTab(self._resettable(self._tab_terrain(), ["terrain", "disturbance"]), "Terrain && Pushes")
+        self.cfg_tabs.addTab(self._resettable(self._tab_episode(), ["episode"]), "Episode && Target")
+        self.cfg_tabs.addTab(self._resettable(self._tab_training(), ["network", "training"]), "Network && Training")
         self.cfg_tabs.addTab(self._tab_inspector(), "Inspector")
         self.left_dock.setWidget(self.cfg_tabs)
+
+    def _resettable(self, widget: QtWidgets.QWidget, sections: List[str]) -> QtWidgets.QWidget:
+        """Wrap a config tab with a 'reset this tab' bar."""
+        w = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        bar = QtWidgets.QHBoxLayout()
+        bar.setContentsMargins(6, 4, 6, 0)
+        hint = QtWidgets.QLabel("Hover any field for help.")
+        hint.setObjectName("muted")
+        bar.addWidget(hint)
+        bar.addStretch(1)
+        b = QtWidgets.QPushButton("↺ Reset this tab to defaults")
+        b.setToolTip("Restore factory defaults for: " + ", ".join(sections))
+        b.clicked.connect(lambda: self.reset_sections(sections))
+        bar.addWidget(b)
+        lay.addLayout(bar)
+        lay.addWidget(scroll(widget), 1)
+        return w
+
+    def reset_sections(self, sections: List[str]):
+        d = default_config()
+        for sec in sections:
+            setattr(self.cfg, sec, getattr(d, sec))
+        self._rebuild_config_ui()
+        self.rebuild_sim()
+        self.log(f"Reset to defaults: {', '.join(sections)}")
+
+    @staticmethod
+    def _mark(widget: QtWidgets.QWidget, ok: bool, msg: str = "") -> None:
+        widget.setStyleSheet("" if ok else "border: 2px solid #e5484d;")
+        widget.setToolTip(widget.toolTip().split("\n⚠")[0] + ("" if ok else f"\n⚠ {msg}"))
 
     def _bind(self, obj, attr, widget, kind="reset"):
         """Bind a widget's value to a config attribute. kind: live | reset | rebuild."""
         def setter(v):
             setattr(obj, attr, v)
             self.config_changed(kind)
+        tip = tooltip_for(obj, attr)
+        if tip:
+            widget.setToolTip(tip)
         if isinstance(widget, (QtWidgets.QDoubleSpinBox, QtWidgets.QSpinBox)):
             widget.valueChanged.connect(setter)
         elif isinstance(widget, QtWidgets.QCheckBox):
@@ -892,9 +1249,12 @@ class MainWindow(QtWidgets.QMainWindow):
         return widget
 
     def _dp_row(self, form, label, dp, kind="reset", decimals=4):
-        w = DistributionWidget(dp, decimals)
+        help_text = ROW_TOOLTIPS.get(label, "")
+        w = DistributionWidget(dp, decimals, help_text=help_text)
         w.changed.connect(lambda: self.config_changed(kind))
-        form.addRow(label, w)
+        lbl = QtWidgets.QLabel(label)
+        lbl.setToolTip(help_text)
+        form.addRow(lbl, w)
         return w
 
     def _tab_robot(self):
@@ -923,11 +1283,15 @@ class MainWindow(QtWidgets.QMainWindow):
         def set_az():
             try:
                 vals = [float(x) for x in az.text().replace(";", ",").split(",") if x.strip()]
-                if len(vals) == 3:
-                    rc.wheel_azimuths_deg = vals
-                    self.config_changed("rebuild")
+                ok = len(vals) == 3
             except ValueError:
-                pass
+                ok = False
+            self._mark(az, ok, "Exactly three angles in degrees, e.g. 0, 120, 240")
+            if ok:
+                rc.wheel_azimuths_deg = vals
+                self.config_changed("rebuild")
+            else:
+                self.statusBar().showMessage("Wheel azimuths need exactly 3 numbers", 5000)
         az.editingFinished.connect(set_az)
         f.addRow("Wheel azimuths [deg]", az)
         f.addRow("Wheel diameter", self._bind(rc, "wheel_diameter_m", fspin(rc.wheel_diameter_m, 0.02, 0.2, 0.001, 4, "m"), "rebuild"))
@@ -1138,11 +1502,15 @@ class MainWindow(QtWidgets.QMainWindow):
         def set_hidden():
             try:
                 vals = [int(x) for x in self.hidden_edit.text().replace(";", ",").split(",") if x.strip()]
-                if vals and all(1 <= x <= 4096 for x in vals):
-                    n.hidden_layers = vals
-                    self.log(f"Hidden layers -> {vals} (new cold-start ONNX on next training start)")
+                ok = bool(vals) and all(1 <= x <= 4096 for x in vals)
             except ValueError:
-                pass
+                ok = False
+            self._mark(self.hidden_edit, ok, "Enter 1-8 comma-separated layer sizes (1-4096), e.g. 64, 64")
+            if not ok:
+                self.statusBar().showMessage("Invalid hidden layers - kept the previous value", 5000)
+                return
+            n.hidden_layers = vals
+            self.log(f"Hidden layers -> {vals} (new cold-start ONNX on next training start)")
         self.hidden_edit.editingFinished.connect(set_hidden)
         f.addRow("Hidden layers", self.hidden_edit)
         ini = QtWidgets.QComboBox()
@@ -1194,6 +1562,20 @@ class MainWindow(QtWidgets.QMainWindow):
         f.addRow("…or every", self._bind(t, "autosave_every_minutes", fspin(t.autosave_every_minutes, 0.5, 600, 0.5, 1, "min"), "live"))
         f.addRow("Seed", self._bind(t, "seed", ispin(t.seed, 0, 2 ** 31 - 1), "live"))
         v.addWidget(g)
+        g = QtWidgets.QGroupBox("Warm start & curriculum (recommended)")
+        f = QtWidgets.QFormLayout(g)
+        ws = QtWidgets.QComboBox()
+        ws.addItem("Behaviour-clone the classical controller, then RL", "bc_classical")
+        ws.addItem("None (RL from scratch)", "none")
+        ws.setCurrentIndex(0 if t.warm_start == "bc_classical" else 1)
+        f.addRow("Warm start", self._bind(t, "warm_start", ws, "live"))
+        f.addRow("Teacher samples", self._bind(t, "bc_samples", ispin(t.bc_samples, 1000, 5_000_000, 10000), "live"))
+        cb = QtWidgets.QCheckBox("Automatic curriculum (difficulty 0 → 1)")
+        cb.setChecked(t.curriculum)
+        f.addRow(self._bind(t, "curriculum", cb, "live"))
+        f.addRow("Advance at survival ≥", self._bind(t, "curriculum_threshold", fspin(t.curriculum_threshold, 0.1, 1.0, 0.05, 2), "live"))
+        f.addRow("Difficulty step", self._bind(t, "curriculum_step", fspin(t.curriculum_step, 0.05, 1.0, 0.05, 2), "live"))
+        v.addWidget(g)
         g = QtWidgets.QGroupBox("Session")
         gl = QtWidgets.QGridLayout(g)
         self.btn_start = QtWidgets.QPushButton("▶ Start")
@@ -1219,6 +1601,8 @@ class MainWindow(QtWidgets.QMainWindow):
         f = QtWidgets.QFormLayout(g)
         self.policy_combo = QtWidgets.QComboBox()
         self.policy_combo.addItem("Zero action (passive)", "zero")
+        self.policy_combo.addItem("Classical controller (baseline)", "classical")
+        self.policy_combo.addItem("Behaviour-cloned policy (warm start)", "bc")
         self.policy_combo.addItem("Initial policy (cold start)", "initial")
         self.policy_combo.addItem("Best policy (auto-reload)", "best")
         self.policy_combo.addItem("Load .onnx file…", "file")
@@ -1230,7 +1614,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for i, (txt, fn) in enumerate((("Export Best .onnx", self.export_best_onnx),
                                        ("Export C++ Policy (.cpp / .h)", self.export_cpp),
                                        ("Export Telemetry (.csv)", self.export_csv),
-                                       ("Export Complete Experiment Bundle (.zip)", self.export_bundle))):
+                                       ("Export Complete Experiment Bundle (.zip)", self.export_bundle),
+                                       ("Export Jetson Deployment Package (.zip)", self.export_jetson_package),
+                                       ("Export Episode Video (.mp4)", self.export_video))):
             b = QtWidgets.QPushButton(txt)
             b.clicked.connect(fn)
             gl.addWidget(b, i // 2, i % 2)
@@ -1331,6 +1717,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._reset_bb8()
         self.recorder = TimelineRecorder(int(self.cfg.viewer.record_seconds * self.cfg.robot.control_hz))
         self.telemetry.clear()
+        self.overlays.clear()
         self._attach_viewport(keep_camera=old_cam is not None)
         if old_cam:
             self.viewport.cam.distance, self.viewport.cam.azimuth, self.viewport.cam.elevation = old_cam
@@ -1363,6 +1750,10 @@ class MainWindow(QtWidgets.QMainWindow):
             opts.pop("target")
         o, info = env.reset(seed=int(time.time() * 1000) % 2 ** 31, options=opts)
         self.last_obs_full = info["obs_full"]
+        if hasattr(self.policy, "reset"):
+            self.policy.reset()
+        if hasattr(self, "overlays"):
+            self.overlays.clear()
         if env.model_version != getattr(self, "_model_version", -1):
             self._attach_viewport(keep_camera=True)
             self._populate_tree()
@@ -1447,6 +1838,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.log(f"Policy error ({e}); falling back to zero action")
             self.policy = None
             return np.zeros(n_act)
+        idx = getattr(self.sim, "act_idx", None)
+        if len(a) == 3 and idx is not None and n_act == len(idx) and n_act != 3:
+            return a[idx]            # full 3-motor controllers on a masked action space
         out = np.zeros(n_act)
         out[:min(n_act, len(a))] = a[:n_act]
         return out
@@ -1470,6 +1864,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     "push_n": float(np.linalg.norm(info["push_force"])),
                     "missed_steps": float(info["missed_steps"].sum())}
             self.recorder.add(info["time"], s.data.qpos, s.data.mocap_pos, vals)
+            self.overlays.record(info["ball_xy"])
             if term or trunc:
                 st = info.get("episode_stats", {})
                 self.log(f"Episode end: {'FALL' if st.get('fallen') else 'timeout'}  survival "
@@ -1866,6 +2261,21 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if source == "zero":
                 self.policy = None
+            elif source == "classical":
+                self.policy = controller_from_config(self.cfg)
+            elif source == "bc":
+                p = os.path.join(ws, "bc_policy.onnx")
+                if not os.path.isfile(p):
+                    QtWidgets.QMessageBox.information(self, "No warm-start policy yet",
+                                                      "bc_policy.onnx is created when training starts with the "
+                                                      "behaviour-cloning warm start.")
+                    return
+                self.policy = PolicyRunner(onnx_path=p)
+            elif source.startswith("plugin:"):
+                hook = load_plugins(self.cfg).controllers.get(source[7:])
+                if hook is None:
+                    raise ValueError(f"plugin controller '{source[7:]}' is not loaded")
+                self.policy = hook.fn(self.cfg)
             elif source == "initial":
                 self.policy = PolicyRunner(onnx_path=ensure_initial_policy(self.cfg))
             elif source == "best":
@@ -1880,7 +2290,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
                 self.policy = PolicyRunner(onnx_path=p)
             self.policy_source = source
-            self.log(f"Viewport policy: {source}" + (f" ({self.policy.source})" if self.policy else ""))
+            if hasattr(self.policy, "reset"):
+                self.policy.reset()
+            src = getattr(self.policy, "source", type(self.policy).__name__) if self.policy is not None else ""
+            self.log(f"Viewport policy: {source}" + (f" ({src})" if src else ""))
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Policy error", str(e))
 
@@ -1933,12 +2346,34 @@ class MainWindow(QtWidgets.QMainWindow):
         for b in (self.btn_pause, self.btn_resume, self.btn_stop):
             b.setEnabled(run)
 
+    def _request_worker(self, cmd: str, ack_types, callback: Callable[[bool], None], timeout_s: float = 20.0):
+        """Send a command to the training worker and call ``callback(acked)`` once it confirms
+        (non-blocking replacement for sleep-and-hope)."""
+        self._req_id = getattr(self, "_req_id", 0) + 1
+        rid = self._req_id
+        if not hasattr(self, "_pending"):
+            self._pending = {}
+        self._pending[rid] = (tuple(ack_types), callback)
+        self.trainer.send(cmd=cmd, req=rid)
+        self.statusBar().showMessage(f"Waiting for the training worker ({cmd})…")
+
+        def timeout():
+            item = self._pending.pop(rid, None)
+            if item:
+                item[1](False)
+        QTimer.singleShot(int(timeout_s * 1000), timeout)
+
     def _poll_trainer(self):
         if self.trainer.msg_q is None:
             return
         latest_frames = None
         for m in self.trainer.poll():
             t = m.get("type")
+            rid = m.get("req")
+            if rid is not None and rid in getattr(self, "_pending", {}) and t in self._pending[rid][0]:
+                _, cb = self._pending.pop(rid)
+                QTimer.singleShot(0, lambda cb=cb: cb(True))
+                self.statusBar().clearMessage()
             if t == "frames":
                 latest_frames = m if latest_frames is None else {**m, "xml": {**latest_frames["xml"], **m["xml"]}}
             elif t == "episode":
@@ -1947,9 +2382,26 @@ class MainWindow(QtWidgets.QMainWindow):
                 if "timesteps" in m:
                     self.progress.setValue(min(m["timesteps"], self.progress.maximum()))
                 fps = f"  {m['fps']:.0f} steps/s" if "fps" in m else ""
-                self.train_lbl.setText(f"{m.get('state', '')}  {m.get('timesteps', 0):,} steps{fps}")
+                eta = ""
+                if m.get("fps", 0) > 1 and m.get("total"):
+                    rem = max(0.0, (m["total"] - m["timesteps"]) / m["fps"])
+                    eta = f"  ETA {int(rem // 3600)}h{int(rem % 3600 // 60):02d}m" if rem >= 3600 else \
+                        f"  ETA {int(rem // 60)}m{int(rem % 60):02d}s"
+                diff = f"  difficulty {self._difficulty:.2f}" if getattr(self, "_difficulty", None) is not None else ""
+                self.train_lbl.setText(f"{m.get('state', '')}  {m.get('timesteps', 0):,} steps{fps}{eta}{diff}")
+            elif t == "curriculum":
+                self._difficulty = m["difficulty"]
+                self.train_plots.add_marker(m.get("timesteps", 0), m["difficulty"])
+            elif t == "warm_start":
+                self.log(f"Warm start done in {m['seconds']:.0f}s: cloned policy survives "
+                         f"{m['mean_survival_s']:.1f}/{m['max_episode_s']:.0f}s "
+                         f"(falls {m['falls']}/{m['episodes']}) - RL fine-tuning starts now")
+            elif t == "eval":
+                self.log(f"Evaluation @ {m['timesteps']:,} (difficulty {m['difficulty']:.2f}): survival "
+                         f"{m['mean_survival_s']:.1f}/{m['max_episode_s']:.0f}s, falls {m['falls']}/{m['episodes']}, "
+                         f"drift {m['mean_drift_m']:.2f} m, score {m['score']:.1f}{'  ★ new best' if m['improved'] else ''}")
             elif t == "best":
-                self.log(f"★ New best policy (mean return {m['mean_return']:.1f} @ {m['timesteps']:,}) -> {m['path']}")
+                self.log(f"★ New best policy (eval score {m['mean_return']:.1f} @ {m['timesteps']:,}) -> {m['path']}")
                 if self.policy_source == "best":
                     self.set_policy("best")
             elif t == "checkpoint":
@@ -1984,8 +2436,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         target = os.path.join(d, f"session_{timestamp()}") if os.path.basename(d) == "sessions" else d
         if self.trainer.running:
-            self.trainer.send(cmd="save")
-            time.sleep(0.2)
+            # wait (without freezing the UI) until the worker confirms the checkpoint was written
+            self._request_worker("save", ("checkpoint",), lambda ok: self._finish_save_session(target, ok))
+            return
+        self._finish_save_session(target, True)
+
+    def _finish_save_session(self, target: str, acked: bool):
+        if not acked:
+            self.log("Worker did not confirm the checkpoint in time (warm start running?) - saving the last one")
         extra = {}
         src = self.trainer.session_dir
         if src and os.path.isdir(src) and os.path.abspath(src) != os.path.abspath(target):
@@ -2030,8 +2488,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def export_best_onnx(self):
         if self.trainer.running:
-            self.trainer.send(cmd="export_best")
-            time.sleep(0.5)
+            self._request_worker("export_best", ("best",), lambda ok: self._finish_export_best(ok))
+            return
+        self._finish_export_best(True)
+
+    def _finish_export_best(self, acked: bool):
+        if not acked:
+            self.log("Worker did not confirm a fresh export in time - exporting the last best_policy.onnx")
         src = self._best_or_initial()
         if not src:
             return
@@ -2191,6 +2654,12 @@ class MainWindow(QtWidgets.QMainWindow):
         print(line, flush=True)
 
     def closeEvent(self, ev):
+        try:
+            self.settings.setValue("last_config", self.cfg.to_json())
+            self.settings.setValue("geometry", self.saveGeometry())
+            self.settings.setValue("state", self.saveState())
+        except Exception:
+            pass
         self.timer.stop()
         if self.trainer.running:
             r = QtWidgets.QMessageBox.question(self, "Quit", "Training is running. Save a checkpoint and stop it?",
@@ -2216,12 +2685,20 @@ def main(argv=None):
     ap.add_argument("--mode", choices=["single", "grid", "headless"])
     ap.add_argument("--screenshot", help="render the window to PNG after N seconds and quit (CI / docs)")
     ap.add_argument("--screenshot-delay", type=float, default=3.0)
+    ap.add_argument("--fresh", action="store_true", help="ignore the remembered configuration (factory defaults)")
     ap.add_argument("--self-test", action="store_true",
                     help="headless check of physics, ONNX/C++ export and a short multi-process training run")
     args = ap.parse_args(argv)
     if args.self_test:
         return self_test(args.workspace)
     cfg = AppConfig.load(args.config) if args.config else default_config()
+    if not args.config and not args.fresh and not args.self_test:
+        try:   # remember the last session's configuration
+            last = QtCore.QSettings("BB8RLSuite", "Studio").value("last_config")
+            if last:
+                cfg = AppConfig.from_json(last)
+        except Exception:
+            cfg = default_config()
     if args.workspace:
         cfg.workspace_dir = args.workspace
     elif getattr(sys, "frozen", False):  # packaged .exe: keep the workspace next to the executable
@@ -2259,10 +2736,18 @@ def self_test(workspace: Optional[str] = None) -> int:
         print(f"[1/3] physics OK ({cfg.robot.ball_radius_m * 200:.0f} cm ball)", flush=True)
         ensure_initial_policy(cfg)
         generate_cpp(PolicySnapshot.load_json(os.path.join(ws, "initial_policy.json")), os.path.join(ws, "exports"))
-        print("[2/3] cold-start ONNX + C++ export OK", flush=True)
+        from plugins import discover_plugins
+        from rl_onnx_cpp_engine import evaluate_policy
+        ev = evaluate_policy(controller_from_config(cfg), cfg, episodes=1, difficulty=1.0, max_seconds=5)
+        if ev["falls"]:
+            raise RuntimeError(f"classical controller fell: {ev}")
+        n_plugins = len(discover_plugins(cfg))
+        build_jetson_package(cfg, os.path.join(ws, "exports"), os.path.join(ws, "initial_policy.onnx"))
+        print(f"[2/3] ONNX + C++ export, classical controller, {n_plugins} plugins, Jetson package OK", flush=True)
         tc = cfg.training
         tc.n_envs, tc.vec_env, tc.n_steps, tc.batch_size, tc.n_epochs = 2, "subproc", 256, 128, 1
         tc.total_timesteps, tc.best_window_episodes = 1024, 2
+        tc.bc_samples, tc.bc_epochs, tc.bc_dagger_rounds, tc.value_warmup_epochs = 3000, 2, 1, 1   # tiny warm start
         cfg.viewer.mode = "headless"
         ctl = TrainingController()
         ctl.start(cfg)
@@ -2277,7 +2762,11 @@ def self_test(workspace: Optional[str] = None) -> int:
         if errs or not any(m["type"] == "episode" for m in msgs):
             print("[3/3] training FAILED:\n" + (errs[0]["trace"] if errs else "no episodes / timeout"), flush=True)
             return 1
-        print(f"[3/3] multi-process training OK ({sum(m['type'] == 'episode' for m in msgs)} episodes)", flush=True)
+        if not any(m["type"] == "warm_start" for m in msgs):
+            print("[3/3] warm start did not run", flush=True)
+            return 1
+        print(f"[3/3] warm start + multi-process training OK ({sum(m['type'] == 'episode' for m in msgs)} episodes)",
+              flush=True)
         print(f"SELF-TEST PASSED in {time.time() - t0:.0f} s  (workspace {ws})", flush=True)
         return 0
     except Exception:

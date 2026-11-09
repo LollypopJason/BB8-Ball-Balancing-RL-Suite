@@ -299,7 +299,7 @@ class RewardWeights:
     action: float = 0.01
     action_rate: float = 0.05
     drift: float = 0.5
-    ball_velocity: float = 1.0              # penalise |v_ball|^2 (prevents run-away drift to wheel-speed saturation)
+    ball_velocity: float = 1.0              # penalise |v_ball| (linear: slow cruising is not free -> no drift)
     target_distance: float = 0.5
     target_progress: float = 5.0
     target_reached_bonus: float = 2.0
@@ -317,6 +317,8 @@ class EpisodeConfig:
     init_tilt_deg: DP = _u(0.0, 3.0, "deg", 0, 20)
     init_yaw_deg: DP = _c(0.0, "deg")
     target_enabled: bool = False
+    hold_spawn_position: bool = True        # no waypoint -> target channels point back to the spawn point
+                                            # (odometry start on the robot) so position hold is observable
     target_x_m: DP = _c(1.0, "m", -20, 20)
     target_y_m: DP = _c(0.0, "m", -20, 20)
     target_reach_radius_m: float = 0.10
@@ -353,6 +355,22 @@ class TrainingConfig:
     autosave_every_steps: int = 100_000
     autosave_every_minutes: float = 5.0
     best_window_episodes: int = 20
+    eval_every_steps: int = 50_000            # deterministic evaluation on fixed seeds -> "best" model selection
+    eval_episodes: int = 4
+    # --- warm start: behaviour cloning of the classical controller, then RL fine-tuning ---
+    warm_start: str = "bc_classical"          # "none" | "bc_classical"
+    bc_samples: int = 150_000                 # teacher (state, action) pairs
+    bc_epochs: int = 25
+    bc_dagger_rounds: int = 2                 # student drives, classical teacher relabels (fixes compounding errors)
+    bc_action_noise: float = 0.25             # executed-action noise while collecting (DART) -> recovery data
+    bc_log_std: float = -2.3                  # PPO exploration std after warm start (exp(-2.3) ~ 0.1)
+    value_warmup_epochs: int = 15             # fit the critic to teacher returns so PPO starts stable
+    # --- automatic curriculum over the domain-randomisation strength ---
+    curriculum: bool = True
+    curriculum_start: float = 0.0             # 0 = nominal physics, 1 = full randomisation + pushes
+    curriculum_step: float = 0.25
+    curriculum_threshold: float = 0.85        # mean survival / max episode length needed to advance
+    curriculum_window: int = 40               # episodes averaged for the decision
     seed: int = 0
     device: str = "cpu"
 
@@ -385,6 +403,14 @@ class CustomModelBinding:
 
 
 @dataclass
+class PluginConfig:
+    directory: str = "plugins"              # relative to the app folder (next to the .exe when packaged)
+    enabled: List[str] = field(default_factory=list)            # plugin file names, e.g. "wind_gusts.py"
+    settings: Dict[str, Dict[str, Any]] = field(default_factory=dict)   # plugin -> setting -> value
+    reward_weights: Dict[str, float] = field(default_factory=dict)      # reward term -> weight override
+
+
+@dataclass
 class AppConfig:
     schema_version: int = CONFIG_SCHEMA_VERSION
     model_type: str = "bb8"                 # "bb8" | "validation_rig" | "custom"
@@ -398,6 +424,7 @@ class AppConfig:
     resources: ResourceConfig = field(default_factory=ResourceConfig)
     viewer: ViewerConfig = field(default_factory=ViewerConfig)
     custom: CustomModelBinding = field(default_factory=CustomModelBinding)
+    plugins: PluginConfig = field(default_factory=PluginConfig)
     workspace_dir: str = "workspace"
 
     # convenience ----------------------------------------------------------

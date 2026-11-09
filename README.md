@@ -20,11 +20,13 @@ native Qt widget.
 4. [Physics model (what is simulated and how)](#4-physics-model)
 5. [Domain randomisation, terrain & disturbances](#5-domain-randomisation-terrain--disturbances)
 6. [Observation / action interface (sim ⇄ hardware contract)](#6-observation--action-interface)
-7. [Training](#7-training)
+7. [Training: classical teacher → behaviour cloning → PPO + curriculum](#7-training)
 8. [Export suite](#8-export-suite)
 9. [Jetson Nano deployment guide](#9-jetson-nano-deployment-guide)
-10. [Testing](#10-testing)
-11. [Engineering compromises & known limitations](#11-engineering-compromises--known-limitations)
+10. [Real-world verification examples](#10-real-world-verification-examples)
+11. [Plugins (add-ons)](#11-plugins-add-ons)
+12. [Testing](#12-testing)
+13. [Engineering compromises & known limitations](#13-engineering-compromises--known-limitations)
 
 ---
 
@@ -67,8 +69,13 @@ native Qt widget.
 | `config_and_distributions.py` | `DistributionParameter` (Constant / Uniform / Normal + clamping), every config dataclass, observation/action channel spec (single source of truth for ordering, units, normalisation), JSON & experiment-ZIP serialisation, Dark/Light themes |
 | `mjcf_generator.py` | Procedural MJCF: BB-8 ballbot, validation rig, dented sphere mesh, terrain, importer, omniwheel geometry/Jacobian |
 | `bb8_gym_env.py` | Gymnasium env with full domain randomisation, stepper/TMC2208 model, IMU noise+drift, pushes, falls, waypoints; `ValidationRigSim` |
-| `rl_onnx_cpp_engine.py` | Cold-start ONNX, ONNX/C++ exporters, SB3 bridge, training worker process, process-tree governor |
-| `main_gui.py` | The desktop application (`--self-test` for headless verification) |
+| `rl_onnx_cpp_engine.py` | Cold-start ONNX, ONNX/C++ exporters, SB3 bridge, behaviour-cloning warm start (+DAgger, critic warm-up), curriculum, evaluation-based best model, training worker, process-tree governor |
+| `classical_controller.py` | Pole-placement balance controller using only robot-measurable signals: baseline, RL teacher, hardware fallback; exports to the same C++ API (numpy-only, ships to the Jetson) |
+| `plugins.py`, `plugins/` | Add-on system (reward terms, step/reset hooks, scene XML, controllers, GUI panels) + 5 example plugins |
+| `verification_examples.py`, `VERIFICATION.md` | 12 quick real-world experiments with simulator predictions, comparison and parameter identification |
+| `deployment_package.py` | One-click Jetson package with a `robot_hw_config.json` generated from the simulator config |
+| `gui_addons.py` | Tooltips, overlays, camera presets, screenshot/video export, verification & plugin dialogs, help |
+| `main_gui.py` | The desktop application (`--self-test` for headless verification, `--fresh` for factory defaults) |
 | `build_exe.bat`, `bb8_studio.spec` | One-click Windows `.exe` build (PyInstaller) |
 | `deployment_jetson/` | Arduino firmware, Jetson Python & C++ runners, CMake, hardware config |
 | `tests/` | Headless smoke tests + scripted end-to-end GUI exercise |
@@ -154,6 +161,23 @@ properties (body: mass / pos / ipos / inertia; geom: friction / size / pos / rgb
 **re-applied after every domain-randomisation reset**. The XML pane shows the selected element's MJCF;
 *Apply XML & Recompile* splices it into the model and recompiles on the fly (*Edit full model XML* for
 arbitrary edits, *Revert to procedural* to go back).
+
+### Menus, presets & remembered settings
+* **File** – *New* (factory defaults), *Open / Save configuration preset* (`workspace/presets/*.json`, recent list),
+  load/save training sessions, **Export** submenu (ONNX, C++, CSV, bundle, **Jetson package**, **video**, screenshot).
+* **View** – modes, theme, **camera presets** (Follow, Front/eye view, Side, Top-down, Wheel close-up, Arena;
+  Alt+1…6), **overlays** (push/wind force arrows, ball trail, CoG markers, velocity arrow, line to waypoint,
+  contact points & forces), reset window layout.
+* **Tools** – *Real-world verification examples*, *Plugin Manager*, plugin actions, open workspace.
+* **Help** – Quick start (F1), keyboard & mouse shortcuts, about.
+* The last configuration, window layout, theme and recent presets are **remembered** between launches
+  (`--fresh` or *File → New* to start clean). Every config tab has **↺ Reset this tab to defaults**.
+* Every field has a **tooltip** (meaning, units, effect); invalid input (e.g. hidden layers `64, abc`) is
+  outlined in red and rejected instead of silently ignored.
+* The viewport starts with the **classical controller** driving the robot, so BB-8 balances out of the box;
+  pick *Behaviour-cloned*, *Best policy*, a plugin controller or any `.onnx` in *Interactive policy*.
+* **F12** saves a 1920×1080 screenshot; *File → Export → Episode video* renders the recorded timeline to
+  MP4 (bundled ffmpeg) or GIF.
 
 ### Timeline scrubber
 Every interactive step records `qpos`, mocap and ~30 telemetry channels (IMU, encoder & command per
@@ -280,31 +304,53 @@ Frames: head x = forward (the "eye"), z = up. Wheel speed positive = right-hande
 
 ## 7. Training
 
-*Network & Training* tab → hidden layers (e.g. `64, 64` or `128, 128, 64`), init, observation/action masks,
-algorithm (PPO default, SAC), parallel envs, vectorisation, timesteps, LR, rollout, batch, γ,
-**auto-save every N steps / M minutes**, seed. Buttons: **Start, Pause** (checkpoint on pause),
-**Resume, Stop** (final checkpoint), **Save Session, Load Session** (Start then resumes from the
-session's `latest_model.zip`).
+The end goal is an RL policy; the suite gets there in three stages that run automatically when you press
+**▶ Start** (*Network & Training* tab):
 
-The worker runs in a separate *spawned* process (GUI stays responsive; ESC can kill it instantly).
-Outputs in `workspace/`:
+1. **Classical teacher** (`classical_controller.py`). A cart-pole style controller on the ball:
+   `a = k_tilt·θ + k_rate·θ̇ + k_vel·v + k_pos·x`, gains from **pole placement** (all four closed-loop poles at
+   `−bandwidth`; note k_vel, k_pos > 0 — to come back the ball first rolls a little further away). It only uses
+   what the real robot measures: IMU, encoder speeds (ball velocity via J⁻¹) and the target error. With the
+   defaults it balances under full randomisation + random pushes for 60 s with zero falls in the simulator.
+2. **Warm start** — behaviour cloning of the teacher into the tanh MLP: ~150 k demonstrations collected in
+   parallel with executed-action noise (DART) for recovery states, then **2 DAgger rounds** (the student drives,
+   the teacher labels every visited state), then the PPO critic is fitted to the demonstrations' returns.
+   Takes ~1–2 min; the cloned network typically already balances 20/20 s at full randomisation.
+   It is saved as `bc_policy.onnx`.
+3. **PPO fine-tuning with an automatic curriculum** — training starts at *difficulty 0* (nominal physics, no
+   pushes) and raises the difficulty by 0.25 whenever the mean survival of the last 40 episodes exceeds 85 %
+   of the episode, up to 1.0 (full randomisation + pushes). The difficulty interpolates every randomised
+   parameter between its nominal value and its random sample.
+
+**Best model selection** is done by **deterministic evaluation on fixed seeds** every 50 k steps (and right
+after the warm start): fewest falls first, then survival, drift and tilt. The warm-started policy is the
+first "best", so an RL checkpoint replaces it only if it is genuinely better — the exported `best_policy.onnx`
+can never be worse than the warm start. (Noisy training returns are only used for the plots.)
+
+Controls: hidden layers (e.g. `64, 64`), init, observation/action masks, algorithm (PPO default, SAC),
+parallel envs, timesteps, LR, rollout, batch, γ, auto-save every N steps / M minutes, warm start on/off,
+teacher samples, curriculum on/off + threshold + step. **Start, Pause** (checkpoint), **Resume, Stop**
+(final checkpoint), **Save / Load Session**. The status line shows steps/s, **ETA** and the curriculum
+difficulty; curriculum steps are drawn as dashed lines in *Training Progress*.
 
 ```
 workspace/
-├ initial_policy.onnx/.json        cold start
-├ best_policy.onnx/.json           best rolling-mean return so far (auto-exported, rate-limited)
+├ initial_policy.onnx/.json        cold start (architecture check)
+├ bc_policy.onnx/.json             warm-start student (behaviour cloning)
+├ best_policy.onnx/.json           best by deterministic evaluation (auto-exported)
 ├ checkpoints/ckpt_<tag>_<steps>.zip   auto / pause / manual / ram_ceiling / final
+├ presets/                         saved configurations
 └ sessions/session_<stamp>/        config.json, latest_model.zip, best_model.zip, training_progress.csv
 ```
 
-`training_progress.csv` logs per episode: timesteps, wall time, return, **survival time**, mean/max
-**tilt**, final **waypoint distance**, fall flag, missed steps.
+`training_progress.csv` logs per episode: timesteps, wall time, return, survival time, mean/max tilt, final
+waypoint distance, fall flag, missed steps and curriculum difficulty.
 
-Reward (weights editable live): alive + upright (1 − (tilt/limit)²) − angular velocity − action − action
-rate − ball velocity² − drift from spawn; with a target: − distance + progress + reach bonus; − fall penalty.
+Reward (weights editable live, plus plugin reward terms): alive + upright (1 − (tilt/limit)²) − angular
+velocity − action − action rate − |ball velocity| − drift from spawn; with a target: − distance + progress +
+reach bonus; − fall penalty.
 
-Tips: start with *Off (Ideal Nominal Physics)* to get a first balancing policy, then enable randomisation
-layers; use Headless Turbo for long runs; 8 envs on 4–8 cores is a good default.
+<!-- results -->
 
 ---
 
@@ -316,6 +362,8 @@ layers; use Headless Turbo for long runs; 8 envs on 4–8 cores is a good defaul
 | **Export C++ Policy (.cpp/.h)** | `bb8_policy_inference.cpp/.h`: C++11 + `<cmath>` only, weights as `static const float`, no heap. API: `bb8::compute_stepper_commands(float imu_roll_rad, float imu_pitch_rad, …, float enc1_vel_rads, …, float target_dx_m, …, float* out_motor1_step_rate, …, float* out_motor1_rads = nullptr, …)` plus `bb8::policy_forward()` and `extern "C" bb8_policy_forward_c()` (for ctypes). |
 | **Export Telemetry (.csv)** | timeline buffer (all channels) + training curves (+ the session's `training_progress.csv`). |
 | **Export Complete Experiment Bundle (.zip)** | `bb8_experiment_<timestamp>.zip`: policy (.onnx + .json), C++ (.cpp/.h), telemetry CSVs, the exact MuJoCo `.xml`, `config_snapshot.json` (every randomisation & hyper-parameter), manifest. |
+| **Export Jetson Deployment Package (.zip)** | everything the robot needs, ready to `scp`: runners, Arduino sketch, CMake, the RL policy (ONNX + C++), the classical controller (Python + C++ with the *same* API), `DEPLOY.md` with the exact commands, and a **`robot_hw_config.json` generated from the simulator config** (geometry, rates, limits) — wiring fields of the template (I²C, UART, GPIO, signs, currents) are preserved, so geometry can no longer get out of sync by hand-copying. |
+| **Export Episode Video (.mp4/.gif)** | renders the recorded timeline at 1280×720 / 30 fps with the current camera and trail overlay. |
 
 The ONNX graph and the C++ code are verified against the numpy reference forward pass in the tests
 (max error < 1e-5).
@@ -417,6 +465,29 @@ motor → 8 µsteps gives ≈39 rad/s, use 4 µsteps for the full 45 rad/s):
 The 24-byte I2C packet, commands (0x01 re-calibrate, 0x02 zero yaw, 0x03 Mahony gains) and scaling are
 documented at the top of the sketch.
 
+### 9.3b The easy way: export a Jetson package
+
+*File → Export → Jetson deployment package* (or the button in *Network & Training*) writes
+`bb8_jetson_package_<time>.zip`. Unzip it on the Jetson and follow its `DEPLOY.md`:
+
+```bash
+python3 jetson_control_loop.py --test signs
+```
+
+```bash
+sudo chrt -f 80 python3 jetson_control_loop.py --controller classical
+```
+
+```bash
+sudo chrt -f 80 python3 jetson_control_loop.py --policy policy/best_policy.onnx
+```
+
+`--controller classical` runs the classical balance controller (first closed-loop test / fallback). The C++
+runner builds against either `policy/cpp` (RL) or `classical/cpp` (classical) — same API.
+`--test <name>` runs the hardware side of the [verification examples](#10-real-world-verification-examples):
+`signs`, `imu-noise`, `encoder-turns`, `motor-step`, `ratio`, `spin`, `straight`, `fall-time`. Each writes
+`verification_results/<test>_<time>.json`, which the desktop app imports and compares with the simulator.
+
 ### 9.4 Prepare the Jetson Nano (JetPack 4.6.x)
 
 ```bash
@@ -514,7 +585,56 @@ from a bundle to reproduce the exact trained configuration.
 
 ---
 
-## 10. Testing
+## 10. Real-world verification examples
+
+*Tools → Real-world verification examples* (or `python verification_examples.py list`, printable
+[`VERIFICATION.md`](VERIFICATION.md)) — twelve short experiments, in the order you should do them:
+
+| # | Experiment | Time | What it verifies / identifies |
+|---|---|---|---|
+| 1 | Measure & enter your robot | 10 min | ball Ø & mass, head mass & CoG (pencil balance), wheel Ø, zenith → **Apply** to config |
+| 2 | Encoder count (turn wheels by hand) | 2 min | encoders, mux channels, signs |
+| 3 | Wiring & sign check (interactive) | 3 min | IMU axes, gyro sign, encoder directions vs. simulator conventions |
+| 4 | IMU noise & drift (robot still) | 2 min | sensor noise → **Apply** to IMU randomisation |
+| 5 | Ball roll-out from a 2 cm ramp (no electronics) | 5 min | **identifies the rolling resistance** of your ball on your floor |
+| 6 | Wheel → ball transmission ratio (rig) | 5 min | wheel Ø, microsteps, roller slip |
+| 7 | Motor step response | 3 min | latency, speed ratio, missed steps |
+| 8 | Spin in place (head held) | 2 min | Jacobian: zenith angle, wheel radius, motor order & signs |
+| 9 | Drive straight (head held) | 3 min | "forward" convention, odometry |
+| 10 | Passive fall time (motors holding) | 5 min | masses / inertia / holding torque (open-loop dynamics) |
+| 11 | First balance with the classical controller | 5 min | closed loop: max tilt & drift vs. simulator |
+| 12 | Push recovery (10 N, 0.2 s) | 5 min | disturbance rejection vs. simulator |
+
+For each: procedure + equipment + safety note, **Compute simulator prediction** (from your current
+config), type your measurement or **Import runner result (.json)**, **Compare** (PASS / CHECK with the
+error), and where meaningful **Apply** (writes the measurement or the identified parameter into the config).
+
+---
+
+## 11. Plugins (add-ons)
+
+Drop a `.py` file into `plugins/` (next to the `.exe` when packaged) and enable it in
+*Tools → Plugin Manager*, where its settings can also be edited. Enabled plugins are loaded in the viewport
+**and in every training subprocess**. Hooks: `reward_term`, `on_reset`, `on_step`
+(`env.add_external_force(...)`, `env.set_target(...)`), `scene_xml`, `controller`, `gui_panel`, `gui_action`,
+`setting`. A crashing hook is disabled with a logged traceback instead of killing training.
+Observation channels are deliberately not pluggable (they are the ONNX/C++/Jetson contract).
+
+Examples in `plugins/`: **wind gusts** (continuous random force), **heading-hold reward**, **slalom course**
+(cones + automatic waypoint route), **sine-sweep controller** (motor verification), **power meter panel**.
+Template:
+
+```python
+PLUGIN_INFO = {"name": "My plugin", "version": "1.0", "description": "What it does"}
+
+def register(api):
+    k = api.setting("gain", 1.0, "editable in the Plugin Manager")
+    api.reward_term("calm_yaw", lambda env: -k * abs(env.last_raw["gyro"][2]))
+```
+
+---
+
+## 12. Testing
 
 ```bash
 python tests/test_smoke.py
@@ -523,7 +643,10 @@ python tests/test_smoke.py
 Covers: distribution sampling & config round-trip; both omniwheel models with heightfield, dents, pushes and
 targets; the validation rig transmission ratio; cold-start ONNX → onnxruntime → reload → generated C++
 compiled with `g++ -Wall -Werror` and compared numerically; experiment ZIP; a short PPO run through the
-real multiprocess `TrainingController` (episodes, frames, checkpoints, best-model ONNX).
+real multiprocess `TrainingController` (episodes, frames, checkpoints, best-model ONNX); the classical
+controller balancing with pushes and its C++ export matching Python over 400 stateful steps; behaviour
+cloning + DAgger + curriculum difficulty; all example plugins (scene, reward, wind force, controller);
+the Jetson package contents and generated config; every verification prediction, comparison and apply.
 
 ```bash
 QT_QPA_PLATFORM=offscreen MUJOCO_GL=osmesa python tests/test_gui_offscreen.py
@@ -531,12 +654,14 @@ QT_QPA_PLATFORM=offscreen MUJOCO_GL=osmesa python tests/test_gui_offscreen.py
 
 Drives the full GUI headlessly: target picking, part selection + live property override, XML splice and
 recompile, zenith slider rebuild, pause/scrub/live, validation rig, theme toggle, 4-agent grid, training
-streamed into the grid, all four exporters, policy loading, MJCF/STL/URDF import + RL binding, headless
-mode and ESC factory reset.
+(with warm start) streamed into the grid, acknowledged worker requests, all exporters (incl. Jetson package,
+screenshot, MP4 video), policy loading, MJCF/STL/URDF import + RL binding, classical controller balancing in
+the viewport, menus, input validation, tooltips, presets, reset-tab, plugins (scene, panel, controller),
+the verification dialog (predict / compare / apply), overlays, camera presets, headless mode and ESC reset.
 
 ---
 
-## 11. Engineering compromises & known limitations
+## 13. Engineering compromises & known limitations
 
 * **Viewport rendering**: MuJoCo renders with its own OpenGL context off-screen and the frame is blitted
   into a native Qt widget. This avoids QOpenGLWidget FBO/context-sharing pitfalls across Windows/Linux/macOS
@@ -548,12 +673,10 @@ mode and ESC factory reset.
 * **Dents** act through the convex hull (flat spots), not as concave pockets.
 * **Odometry** (target observation on hardware) assumes no slip; while wheels slip it over-estimates
   distance — retrain with targets disabled for pure balancing if you do not need waypoints.
-* **Training status (measured, not yet solved)**: with the default randomisation on a 4-core CPU
-  (~1.4 k steps/s), PPO goes from ~0.6 s to ~7–8 s mean survival (episode limit 20 s) within 0.5–1.2 M steps
-  and then plateaus. The dominant failure mode is a slow drift that builds up until the wheels saturate at
-  `stepper_max_speed_rads` (~1.7 m/s ball speed), after which the head falls. Expect to need longer runs
-  (several million steps, Headless Turbo, all cores) and reward/curriculum tuning (e.g. start with
-  *Off (Ideal Nominal Physics)*, raise `ball_velocity`/`drift` weights) to get a policy fit for hardware.
-  A hand-tuned PD velocity controller balances the same model indefinitely, so the plant is controllable.
+* **Multi-roller omniwheel model at R = 0.25 m**: rollers intermittently lose contact with the larger ball
+  (wheel speed spikes, many missed steps); the classical controller falls after ~2 s in this mode. Use the
+  default *virtual* model for training and control design until the roller model is re-tuned.
+* **Passive fall time** is only weakly sensitive to the head CoG height with a 50 cm ball (the ball radius
+  dominates), so the verification catalog uses it as a check, not to identify the CoG.
 * Policies are geometry-specific: retrain (or fine-tune from the session) after changing zenith angle,
   wheel size or ball radius.

@@ -322,10 +322,17 @@ The end goal is an RL policy; the suite gets there in three stages that run auto
    of the episode, up to 1.0 (full randomisation + pushes). The difficulty interpolates every randomised
    parameter between its nominal value and its random sample.
 
-**Best model selection** is done by **deterministic evaluation on fixed seeds** every 50 k steps (and right
-after the warm start): fewest falls first, then survival, drift and tilt. The warm-started policy is the
-first "best", so an RL checkpoint replaces it only if it is genuinely better — the exported `best_policy.onnx`
-can never be worse than the warm start. (Noisy training returns are only used for the plots.)
+PPO fine-tuning after a warm start is deliberately **gentle** (learning rate × 0.3, clip range 0.1): with the
+full learning rate PPO measurably destroyed the cloned behaviour (7/10 falls after 1 M steps).
+
+**Best model selection** is done by **deterministic evaluation on fixed seeds** — 8 episodes of 40 s (twice
+the training episode, to reward long-horizon robustness) every 100 k steps and right after the warm start:
+fewest falls first, then survival, drift and tilt. The warm-started policy is the first "best"; when the
+curriculum raises the difficulty the previous best is re-scored at the new difficulty, so an RL checkpoint
+replaces it only if it is genuinely better. Noisy training returns are only used for the plots.
+
+Without a waypoint the target observation points back to the **spawn point** (on the robot: the odometry
+origin), so holding position is observable for the network — without it the policies drifted metres away.
 
 Controls: hidden layers (e.g. `64, 64`), init, observation/action masks, algorithm (PPO default, SAC),
 parallel envs, timesteps, LR, rollout, batch, γ, auto-save every N steps / M minutes, warm start on/off,
@@ -350,7 +357,19 @@ Reward (weights editable live, plus plugin reward terms): alive + upright (1 −
 velocity − action − action rate − |ball velocity| − drift from spawn; with a target: − distance + progress +
 reach bonus; − fall penalty.
 
-<!-- results -->
+**Measured results** (simulator, 4-core CPU at ~1.4 k steps/s, full randomisation + random pushes,
+evaluated on fresh seeds; default settings):
+
+| Policy | 20 s episodes (10) | 60 s episodes (4) |
+|---|---|---|
+| Classical controller (teacher) | 0 falls · max tilt 3.2° · drift 0.08 m | 0 falls · 3.4° · 0.08 m |
+| Warm-start student (BC + DAgger, ~1.5 min) | 0 falls · 3.2° · 0.08 m | 1 fall · 10.2° · 0.32 m |
+| **After 600 k PPO steps** (curriculum reached difficulty 1.0 at 505 k, ~12 min) | **0 falls** · 3.9° · 0.29 m | **0 falls** · 4.8° · 0.34 m |
+| Earlier pipeline: PPO from scratch, 1.2 M steps | mean survival ~7.5 s of 20 s | — |
+
+RL fine-tuning improved long-horizon robustness over the cloned student (no falls in 60 s episodes) at the
+cost of a little more drift. The classical controller is still the most robust policy in the simulator, so
+use it for the first hardware tests and as the reference every RL policy has to beat.
 
 ---
 

@@ -107,6 +107,7 @@ def test_short_training():
     c.training.total_timesteps = 2048
     c.training.best_window_episodes = 2
     c.training.warm_start = "none"          # warm start has its own test
+    c.training.eval_episodes, c.training.eval_seconds = 1, 3.0
     c.viewer.mode = "grid"
     tcn = TrainingController()
     tcn.start(c)

@@ -782,15 +782,17 @@ def _training_loop(cfg: AppConfig, msg_q, cmd_q, pause_ev, stop_ev, resume_path,
                                          f"session {session_dir}"})
     algo = PPO if tc.algorithm.upper() == "PPO" else SAC
     hidden = list(cfg.network.hidden_layers)
+    warm = tc.warm_start == "bc_classical" and not (resume_path and os.path.isfile(resume_path))
+    lr = tc.learning_rate * (tc.finetune_lr_scale if warm else 1.0)
     if algo is PPO:
         pk = dict(net_arch=dict(pi=hidden, vf=hidden), activation_fn=nn.Tanh, ortho_init=True,
                   log_std_init=tc.log_std_init)
-        kwargs = dict(learning_rate=tc.learning_rate, n_steps=tc.n_steps, batch_size=tc.batch_size,
+        kwargs = dict(learning_rate=lr, n_steps=tc.n_steps, batch_size=tc.batch_size,
                       n_epochs=tc.n_epochs, gamma=tc.gamma, gae_lambda=tc.gae_lambda, ent_coef=tc.ent_coef,
-                      clip_range=tc.clip_range)
+                      clip_range=tc.finetune_clip_range if warm else tc.clip_range)
     else:
         pk = dict(net_arch=dict(pi=hidden, qf=[256, 256]), activation_fn=nn.Tanh)
-        kwargs = dict(learning_rate=tc.learning_rate, batch_size=tc.batch_size, gamma=tc.gamma,
+        kwargs = dict(learning_rate=lr, batch_size=tc.batch_size, gamma=tc.gamma,
                       buffer_size=tc.sac_buffer_size, train_freq=1, gradient_steps=1)
     if resume_path and os.path.isfile(resume_path):
         model = algo.load(resume_path, env=venv, device=tc.device)
@@ -843,7 +845,7 @@ def _training_loop(cfg: AppConfig, msg_q, cmd_q, pause_ev, stop_ev, resume_path,
             """Deterministic evaluation on fixed seeds at the current difficulty. 'Best' = fewest falls,
             then a score from survival, drift and tilt - noisy training returns are NOT used for this."""
             ev = evaluate_policy(SB3PolicyFn(self.model, cfg), cfg, episodes=tc.eval_episodes, seed=777,
-                                 difficulty=self.difficulty)
+                                 difficulty=self.difficulty, max_seconds=tc.eval_seconds)
             score = self._score(ev)
             improved = score > self.best
             _send(msg_q, {"type": "eval", "timesteps": self.num_timesteps, "difficulty": self.difficulty,
@@ -863,7 +865,7 @@ def _training_loop(cfg: AppConfig, msg_q, cmd_q, pause_ev, stop_ev, resume_path,
             self.best = -math.inf
             if getattr(self, "best_snap", None) is not None:
                 ev = evaluate_policy(PolicyRunner(self.best_snap), cfg, episodes=tc.eval_episodes, seed=777,
-                                     difficulty=self.difficulty)
+                                     difficulty=self.difficulty, max_seconds=tc.eval_seconds)
                 self.best = self._score(ev)
                 _send(msg_q, {"type": "log", "text": f"Previous best re-scored at difficulty {self.difficulty:.2f}: "
                                                      f"{self.best:.1f}"})

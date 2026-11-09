@@ -190,7 +190,7 @@ Runner: `python3 jetson_control_loop.py --test fall-time`
 |---|---|---|---|
 | Balanced for | s | 30 | |
 | Max tilt | deg | 1.613 | |
-| Drift after 30 s | m | 0.06264 | |
+| Drift after 30 s | m | 0.07018 | |
 
 ## 12. Push recovery (10 N, 0.2 s)
 *Closed loop - about 5 min.* Compares disturbance rejection of sim and robot - tells you if the randomisation ranges are wide enough.
@@ -204,6 +204,6 @@ Runner: `python3 jetson_control_loop.py --test fall-time`
 
 | Measure | Unit | Simulator prediction | Your value |
 |---|---|---|---|
-| Max tilt | deg | 8.175 | |
-| Recovery time | s | 2.53 | |
+| Max tilt | deg | 8.027 | |
+| Recovery time | s | 2.56 | |
 

@@ -2748,6 +2748,7 @@ def self_test(workspace: Optional[str] = None) -> int:
         tc.n_envs, tc.vec_env, tc.n_steps, tc.batch_size, tc.n_epochs = 2, "subproc", 256, 128, 1
         tc.total_timesteps, tc.best_window_episodes = 1024, 2
         tc.bc_samples, tc.bc_epochs, tc.bc_dagger_rounds, tc.value_warmup_epochs = 3000, 2, 1, 1   # tiny warm start
+        tc.eval_episodes, tc.eval_seconds = 1, 3.0
         cfg.viewer.mode = "headless"
         ctl = TrainingController()
         ctl.start(cfg)

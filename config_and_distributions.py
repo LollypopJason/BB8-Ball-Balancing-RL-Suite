@@ -355,8 +355,9 @@ class TrainingConfig:
     autosave_every_steps: int = 100_000
     autosave_every_minutes: float = 5.0
     best_window_episodes: int = 20
-    eval_every_steps: int = 50_000            # deterministic evaluation on fixed seeds -> "best" model selection
-    eval_episodes: int = 4
+    eval_every_steps: int = 100_000           # deterministic evaluation on fixed seeds -> "best" model selection
+    eval_episodes: int = 8
+    eval_seconds: float = 40.0                # longer than training episodes: rewards long-horizon robustness
     # --- warm start: behaviour cloning of the classical controller, then RL fine-tuning ---
     warm_start: str = "bc_classical"          # "none" | "bc_classical"
     bc_samples: int = 150_000                 # teacher (state, action) pairs
@@ -365,6 +366,8 @@ class TrainingConfig:
     bc_action_noise: float = 0.25             # executed-action noise while collecting (DART) -> recovery data
     bc_log_std: float = -2.3                  # PPO exploration std after warm start (exp(-2.3) ~ 0.1)
     value_warmup_epochs: int = 15             # fit the critic to teacher returns so PPO starts stable
+    finetune_lr_scale: float = 0.3            # gentler PPO after a warm start (protects the cloned behaviour)
+    finetune_clip_range: float = 0.1
     # --- automatic curriculum over the domain-randomisation strength ---
     curriculum: bool = True
     curriculum_start: float = 0.0             # 0 = nominal physics, 1 = full randomisation + pushes

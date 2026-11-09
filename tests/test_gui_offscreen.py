@@ -128,6 +128,7 @@ def main():
     win.cfg.training.bc_epochs = 3
     win.cfg.training.bc_dagger_rounds = 1
     win.cfg.training.value_warmup_epochs = 2
+    win.cfg.training.eval_episodes, win.cfg.training.eval_seconds = 1, 3.0
     win.start_training()
     acks = []
     assert wait_until(app, lambda: any("Warm start done" in b.text() for b in [win.log_box.document().lastBlock()])
